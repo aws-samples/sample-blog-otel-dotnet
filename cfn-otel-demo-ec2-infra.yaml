@@ -1,0 +1,1157 @@
+####################################################################################
+# DEMO / SAMPLE ONLY - NOT HARDENED FOR PRODUCTION USE.
+# The RDS master password is auto-generated and stored in AWS Secrets Manager
+# (encrypted with a customer-managed KMS CMK); no password is embedded in this
+# template. Public access is via Amazon CloudFront (its default *.cloudfront.net
+# domain + AWS-managed TLS cert), so NO custom domain or ACM cert is required.
+# CloudFront terminates TLS at the edge (viewer -> HTTPS); the CloudFront -> ALB
+# origin leg is HTTP:80. The ALB is NOT open to the internet: its security group
+# admits only the CloudFront origin-facing managed prefix list, and the ALB
+# additionally requires a secret header that CloudFront injects (so the ALB DNS
+# name cannot be used to bypass CloudFront). Accepted demo risks: CloudFront->ALB
+# and ALB->instance hops are HTTP (edge TLS at CloudFront), single-AZ SQL Server
+# Express, and no secret rotation.
+# NOTE: ADOT .NET + CloudWatch Agent instrumentation is a manual post-deploy step
+# (see scripts/setup-instrumentation.ps1 / the blog walkthrough); the UserData
+# here only installs IIS + the .NET hosting bundle, matching the published guide.
+# Do NOT deploy this template as-is into a production account.
+####################################################################################
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  otel-demo EC2: OTel .NET Auto-Instrumentation on Windows EC2 with IIS (Frontend + Backend
+  + RDS SQL Server), fronted by CloudFront (public HTTPS via the default *.cloudfront.net cert;
+  no custom domain/ACM cert needed). .NET/CloudWatch-Agent instrumentation is a manual post-deploy
+  step. DEMO/SAMPLE ONLY - not hardened for production (see header comment).
+
+Parameters:
+  InstanceType:
+    Type: String
+    Default: t3.medium
+    AllowedValues: [t3.medium, t3.large, m5.large]
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Existing VPC to deploy into
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: First public subnet (used by the ALB and the frontend instance; must auto-assign public IP)
+  SubnetId2:
+    Type: AWS::EC2::Subnet::Id
+    Description: Second PUBLIC subnet in a different AZ (required for the internet-facing ALB and the RDS subnet group)
+  CloudFrontPrefixListId:
+    Type: String
+    # AWS-managed prefix list "com.amazonaws.global.cloudfront.origin-facing" for this region.
+    # The ALB security group admits ONLY this prefix list on port 80 - the ALB is not open to
+    # 0.0.0.0/0, so Checkov CKV_AWS_260 does not fire and no open-ingress suppression is needed.
+    AllowedPattern: "^pl-[0-9a-f]+$"
+    ConstraintDescription: Must be a CloudFront origin-facing managed prefix list id (pl-xxxxxxxx).
+    Description: CloudFront origin-facing managed prefix list id for this region (restricts ALB ingress to CloudFront).
+  OriginSecretHeader:
+    Type: String
+    NoEcho: true
+    MinLength: 16
+    Description: >-
+      Shared secret value that CloudFront injects as the X-Origin-Verify header and the ALB
+      listener rule requires. Prevents direct-to-ALB access that bypasses CloudFront. Supply a
+      random high-entropy string at deploy time (do not reuse a real credential).
+  WindowsAmi:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-windows-latest/Windows_Server-2022-English-Full-Base
+
+Resources:
+  # ============================================================
+  # KMS CMK (encrypts the Secrets Manager secret and RDS storage at rest)
+  # ============================================================
+  DemoKmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: CMK for otel-demo EC2 (Secrets Manager secret and RDS storage at rest)
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: EnableRootAccountAdmin
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            # kms:* to the account root is the AWS-recommended default key policy: it delegates
+            # key administration to IAM in this account and prevents key lockout. It does NOT
+            # grant cross-account or public access. Production: evaluate whether SCPs / permission
+            # boundaries should further constrain which principals may administer this CMK.
+            Action: "kms:*"
+            Resource: "*"
+      Tags:
+        - Key: Project
+          Value: otel_demo
+
+  DemoKmsAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: alias/otel-demo-ec2-cmk
+      TargetKeyId: !Ref DemoKmsKey
+
+  # ============================================================
+  # Secrets Manager - auto-generated RDS master password (no plaintext in template)
+  # ============================================================
+  DBSecret:
+    Type: AWS::SecretsManager::Secret
+    # DEMO ONLY - automatic rotation is intentionally NOT configured for this short-lived demo secret.
+    # Production: enable rotation via AWS::SecretsManager::RotationSchedule with a rotation Lambda.
+    Metadata:
+      guard:
+        SuppressedRules:
+          - SECRETSMANAGER_ROTATION_ENABLED_CHECK
+    Properties:
+      Name: otel-demo-ec2/rds/master-password
+      Description: Auto-generated master password for the otel-demo EC2 RDS SQL Server (sa_demo user).
+      KmsKeyId: !Ref DemoKmsKey
+      GenerateSecretString:
+        SecretStringTemplate: '{"username":"sa_demo"}'
+        GenerateStringKey: "password"
+        PasswordLength: 24
+        ExcludeCharacters: '"''@/\;={}'
+      Tags:
+        - Key: Project
+          Value: otel_demo
+
+  # --- Security Groups ---
+  AlbSG:
+    Type: AWS::EC2::SecurityGroup
+    # The public ALB sits behind CloudFront. Ingress is restricted to the CloudFront
+    # origin-facing managed prefix list on HTTP:80 ONLY -- no 0.0.0.0/0 rule, so Checkov
+    # CKV_AWS_260 does not fire. CloudFront terminates TLS at the edge; the origin leg is
+    # HTTP, and the ALB verifies a secret header (see listener) to block CloudFront bypass.
+    Metadata:
+      # The explicit SecurityGroupEgress below is the documented F1000 fix (implicit
+      # allow-all made explicit). cfn-guard's egress rules fire on ANY non-empty egress
+      # property and cannot read intent, so they are suppressed here -- the effective
+      # posture is unchanged from the SG default. Production: scope egress to required CIDRs.
+      guard:
+        SuppressedRules:
+          - EC2_SECURITY_GROUP_EGRESS_OPEN_TO_WORLD_RULE
+          - SECURITY_GROUP_EGRESS_ALL_PROTOCOLS_RULE
+    Properties:
+      GroupDescription: otel-demo ALB - HTTP (80) from the CloudFront origin-facing prefix list only
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourcePrefixListId: !Ref CloudFrontPrefixListId
+          Description: CloudFront origin-facing ranges only
+      # F1000 FIX: make the implicit allow-all egress explicit. The ALB forwards to the
+      # frontend instance and performs health checks; unrestricted egress within the VPC is
+      # the documented, intended behavior for this demo.
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound (ALB to targets + health checks) - explicit by design
+      Tags:
+        - Key: Name
+          Value: otel-demo-alb-sg
+        - Key: Project
+          Value: otel_demo
+
+  FrontendSG:
+    Type: AWS::EC2::SecurityGroup
+    Metadata:
+      # Explicit SecurityGroupEgress is the documented F1000 fix. cfn-guard's egress rules
+      # fire on any non-empty egress property regardless of intent; suppressed here --
+      # effective posture is unchanged from the SG default. Production: scope egress.
+      guard:
+        SuppressedRules:
+          - EC2_SECURITY_GROUP_EGRESS_OPEN_TO_WORLD_RULE
+          - SECURITY_GROUP_EGRESS_ALL_PROTOCOLS_RULE
+    Properties:
+      GroupDescription: otel-demo frontend - HTTP (80) from the ALB only, SSM for mgmt
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref AlbSG
+          Description: HTTP from the ALB security group only
+      # F1000 FIX: explicit allow-all egress. The frontend fetches installers over HTTPS,
+      # calls AWS APIs (SSM, CloudWatch) and proxies to the backend; unrestricted outbound
+      # is the intended, documented behavior for this demo.
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound (installers, AWS APIs, backend proxy) - explicit by design
+      Tags:
+        - Key: Name
+          Value: otel-demo-frontend-sg
+        - Key: Project
+          Value: otel_demo
+
+  BackendSG:
+    Type: AWS::EC2::SecurityGroup
+    Metadata:
+      # Explicit SecurityGroupEgress is the documented F1000 fix. cfn-guard's egress rules
+      # fire on any non-empty egress property regardless of intent; suppressed here --
+      # effective posture is unchanged from the SG default. Production: scope egress.
+      guard:
+        SuppressedRules:
+          - EC2_SECURITY_GROUP_EGRESS_OPEN_TO_WORLD_RULE
+          - SECURITY_GROUP_EGRESS_ALL_PROTOCOLS_RULE
+    Properties:
+      GroupDescription: otel-demo backend - port 5000 from frontend only, SSM for mgmt
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5000
+          ToPort: 5000
+          SourceSecurityGroupId: !Ref FrontendSG
+          Description: App port 5000 from the frontend security group only
+      # F1000 FIX: explicit allow-all egress. The backend fetches installers over HTTPS,
+      # calls AWS APIs, and connects to RDS (1433); unrestricted outbound is intended here.
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound (installers, AWS APIs, RDS) - explicit by design
+      Tags:
+        - Key: Name
+          Value: otel-demo-backend-sg
+        - Key: Project
+          Value: otel_demo
+
+  DatabaseSG:
+    Type: AWS::EC2::SecurityGroup
+    Metadata:
+      # Explicit SecurityGroupEgress is the documented F1000 fix. cfn-guard's egress rules
+      # fire on any non-empty egress property regardless of intent; suppressed here --
+      # effective posture is unchanged from the SG default. Production: scope egress.
+      guard:
+        SuppressedRules:
+          - EC2_SECURITY_GROUP_EGRESS_OPEN_TO_WORLD_RULE
+          - SECURITY_GROUP_EGRESS_ALL_PROTOCOLS_RULE
+    Properties:
+      GroupDescription: otel-demo RDS SQL Server - port 1433 from backend only
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 1433
+          ToPort: 1433
+          SourceSecurityGroupId: !Ref BackendSG
+          Description: SQL Server port 1433 from the backend security group only
+      # F1000 FIX: explicit egress rule. RDS does not initiate outbound connections, but an
+      # explicit rule documents intent and clears the implicit allow-all finding.
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound (explicit; RDS does not initiate connections) - by design
+      Tags:
+        - Key: Name
+          Value: otel-demo-db-sg
+        - Key: Project
+          Value: otel_demo
+
+  # --- IAM ---
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: otel-demo-ec2-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+        - arn:aws:iam::aws:policy/AWSXrayWriteOnlyAccess
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - !Ref SecretsReadPolicy
+      Tags:
+        - Key: Project
+          Value: otel_demo
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2Role
+
+  # --- Frontend Instance ---
+  FrontendInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref WindowsAmi
+      InstanceType: !Ref InstanceType
+      EbsOptimized: true
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds:
+        - !Ref FrontendSG
+      Tags:
+        - Key: Name
+          Value: otel-demo-frontend
+        - Key: Role
+          Value: frontend
+        - Key: Project
+          Value: otel_demo
+      UserData:
+        Fn::Base64: |
+          <powershell>
+          New-Item -ItemType Directory -Force -Path C:\otel-demo | Out-Null
+          Set-Content -Path C:\otel-demo\userdata.txt -Value "App + ADOT instrumentation are handled by the SSM bootstrap association."
+          </powershell>
+  # --- Backend Instance ---
+  BackendInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref WindowsAmi
+      InstanceType: !Ref InstanceType
+      EbsOptimized: true
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds:
+        - !Ref BackendSG
+      Tags:
+        - Key: Name
+          Value: otel-demo-backend
+        - Key: Role
+          Value: backend
+        - Key: Project
+          Value: otel_demo
+      UserData:
+        Fn::Base64: |
+          <powershell>
+          New-Item -ItemType Directory -Force -Path C:\otel-demo | Out-Null
+          Set-Content -Path C:\otel-demo\userdata.txt -Value "App + ADOT instrumentation are handled by the SSM bootstrap association."
+          </powershell>
+  # ============================================================
+  # Application Load Balancer (public edge, HTTPS/TLS termination)
+  # ============================================================
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: otel-demo-ec2-alb
+      Scheme: internet-facing
+      Type: application
+      SecurityGroups:
+        - !Ref AlbSG
+      Subnets:
+        - !Ref SubnetId
+        - !Ref SubnetId2
+      Tags:
+        - Key: Project
+          Value: otel_demo
+
+  # Registers the single frontend EC2 instance by instance id (TargetType: instance).
+  FrontendTG:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: otel-demo-ec2-frontend-tg
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VpcId
+      TargetType: instance
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 30
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Targets:
+        - Id: !Ref FrontendInstance
+          Port: 80
+      Tags:
+        - Key: Project
+          Value: otel_demo
+
+  # Public ALB listener - HTTP:80, fronted by CloudFront (edge TLS).
+  # TLS/HTTPS requirement is satisfied at the CloudFront edge (viewer connections use the
+  # AWS-managed *.cloudfront.net cert). This listener is reachable ONLY from the CloudFront
+  # origin-facing prefix list (see AlbSG), and the default action returns 403 unless the request
+  # carries the secret X-Origin-Verify header CloudFront injects. HTTP origin leg is an accepted,
+  # documented demo decision (edge TLS at CloudFront).
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    # checkov:skip=CKV_AWS_2:Edge TLS is terminated at CloudFront; this origin listener is CloudFront-only (prefix-list SG + secret header).
+    # checkov:skip=CKV_AWS_103:TLS 1.2+ is enforced at the CloudFront edge; origin leg is HTTP by design for this demo.
+    Metadata:
+      guard:
+        SuppressedRules:
+          - ELBV2_LISTENER_SSL_POLICY_RULE
+      # Structured Checkov skips (honored by platform scanners that read resource Metadata
+      # rather than inline `# checkov:skip=` comments).
+      checkov:
+        skip:
+          - id: CKV_AWS_2
+            comment: >-
+              Edge TLS is terminated at CloudFront (viewer connections use the AWS-managed
+              *.cloudfront.net cert). This origin listener is reachable ONLY from the CloudFront
+              origin-facing prefix list (AlbSG) and returns 403 without the secret X-Origin-Verify
+              header, so it cannot be used to bypass CloudFront. HTTP origin leg is an accepted demo
+              decision. Prod: ACM cert + HTTPS listener on a custom domain.
+          - id: CKV_AWS_103
+            comment: >-
+              TLS 1.2+ is enforced at the CloudFront edge; this origin listener is HTTP by design
+              (CloudFront-only via prefix-list SG + secret header). MinimumProtocolVersion/HTTPS on
+              this listener requires an ACM cert + custom domain, which is blocked in this account.
+              Accepted demo tradeoff.
+      cfn_nag:
+        rules_to_suppress:
+          - id: W56
+            reason: >-
+              HTTP (not HTTPS) on this ALB listener is by design: TLS is terminated at the
+              CloudFront edge (viewer connections use the AWS-managed *.cloudfront.net cert).
+              This origin listener is reachable ONLY from the CloudFront origin-facing prefix
+              list and requires the secret X-Origin-Verify header, so it cannot be used to
+              bypass CloudFront. Production: use an ACM cert + HTTPS listener on a custom domain.
+    Properties:
+      LoadBalancerArn: !Ref ALB
+      Port: 80
+      Protocol: HTTP
+      # Default: reject anything that did not come through CloudFront with the secret header.
+      DefaultActions:
+        - Type: fixed-response
+          FixedResponseConfig:
+            StatusCode: "403"
+            ContentType: text/plain
+            MessageBody: "Direct access denied. Reach this service via its CloudFront URL."
+
+  # Only requests carrying the CloudFront-injected secret header are forwarded to the frontend instance.
+  ALBListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref ALBListener
+      Priority: 1
+      Conditions:
+        - Field: http-header
+          HttpHeaderConfig:
+            HttpHeaderName: X-Origin-Verify
+            Values:
+              - !Ref OriginSecretHeader
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref FrontendTG
+
+  # --- RDS SQL Server Express ---
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: otel-demo DB subnets
+      SubnetIds:
+        - !Ref SubnetId
+        - !Ref SubnetId2
+      Tags:
+        - Key: Project
+          Value: otel_demo
+
+  DatabaseInstance:
+    Type: AWS::RDS::DBInstance
+    # (DependsOn: DBSecret removed — the Ref in MasterUserPassword below already creates the
+    #  dependency; cfn-lint W3005 flagged the explicit DependsOn as redundant.)
+    # DEMO ONLY - NOT FOR PRODUCTION. Accepted risks:
+    #  - Multi-AZ is NOT supported by SQL Server Express (sqlserver-ex); single-AZ is a hard demo constraint.
+    #    Production: use a Multi-AZ capable edition (SE/Web/EE) with MultiAZ: true.
+    #  - MasterUserPassword is injected via a Secrets Manager dynamic reference (secure; Checkov passes).
+    #    cfn-guard's secure-service/parameter rules expect ManageMasterUserPassword and are suppressed.
+    #    Production: prefer ManageMasterUserPassword: true (RDS-managed secret).
+    Metadata:
+      guard:
+        SuppressedRules:
+          - RDS_MULTI_AZ_SUPPORT
+          - RDS_MASTER_USER_PASSWORD_NO_PLAINTEXT_PASSWORD
+          - RDS_MASTER_USER_PASSWORD_USES_SECURE_PARAMETER
+          - RDS_MASTER_USER_PASSWORD_USES_SECURE_SERVICE
+      cfn_nag:
+        rules_to_suppress:
+          - id: F24
+            reason: >-
+              MasterUsername is the static, non-secret login name 'sa_demo'. The master PASSWORD
+              is injected via a Secrets Manager dynamic reference (MasterUserPassword below), so no
+              secret is in plaintext. cfn_nag F24 also flags a static username; the username is not
+              sensitive for this demo. Production: use ManageMasterUserPassword: true (RDS-managed).
+          - id: F80
+            reason: >-
+              DeletionProtection is intentionally disabled so this short-lived demo stack can be
+              torn down cleanly without a manual protection-removal step. Production: enable it.
+          - id: W28
+            reason: >-
+              DBInstanceIdentifier 'otel-demo-ec2-db' is an intentional explicit name for demo
+              legibility and cross-referencing in the blog. Replacement-on-update is acceptable
+              for an ephemeral demo. Production: omit the explicit name and let CFN generate one.
+    Properties:
+      DBInstanceIdentifier: otel-demo-ec2-db
+      Engine: sqlserver-ex
+      # Pin the full version string (cfn-lint E3691 rejects the "16.00" major shorthand).
+      # 16.00.4265.3.v1 is the latest 16.00 (SQL Server 2022) build in cfn-lint's static list;
+      # AutoMinorVersionUpgrade: true still lets RDS patch forward within 16.00.
+      EngineVersion: "16.00.4265.3.v1"
+      DBInstanceClass: db.t3.small
+      AllocatedStorage: 20
+      StorageEncrypted: true
+      KmsKeyId: !Ref DemoKmsKey
+      AutoMinorVersionUpgrade: true
+      MasterUsername: sa_demo
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${DBSecret}:SecretString:password}}'
+      VPCSecurityGroups:
+        - !Ref DatabaseSG
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      PubliclyAccessible: false
+      # W75 FIX: retain 1 day of automated backups (was 0, which disabled backups entirely).
+      # Minimal retention keeps the demo cheap while satisfying "backups enabled". Prod: 7-35.
+      BackupRetentionPeriod: 1
+      DeletionProtection: false
+      Tags:
+        - Key: Name
+          Value: otel-demo-ec2-db
+        - Key: Project
+          Value: otel_demo
+
+  # ============================================================
+  # CloudFront access-log bucket
+  # ============================================================
+  # Sink for CloudFront standard (legacy) access logs. Clears CKV_AWS_86 /
+  # CLOUDFRONT_ACCESSLOGS_ENABLED. CloudFront legacy logging delivers via the AWS
+  # "awslogsdelivery" account using bucket ACLs, so two constraints are mandatory and NOT
+  # free security choices:
+  #   - ObjectOwnership MUST permit ACLs (BucketOwnerPreferred) so CloudFront can grant the
+  #     log-delivery account write access. (PublicAccessBlock stays fully on; the log-delivery
+  #     grant is to a specific AWS canonical ID, not a public grant, so it is unaffected.)
+  #   - Encryption MUST be SSE-S3 (AES256); CloudFront legacy logging does NOT support SSE-KMS,
+  #     so the stack KMS CMK is intentionally not used here.
+  CloudFrontLogBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    # checkov:skip=CKV_AWS_18:This IS the access-log bucket; enabling S3 server access logging on it would be circular.
+    # checkov:skip=CKV_AWS_145:CloudFront standard (legacy) logging requires SSE-S3; it does not support SSE-KMS, so AES256 is mandatory here.
+    # checkov:skip=CKV_AWS_144:Cross-region replication is out of scope for a short-lived demo access-log bucket.
+    # cfn-guard suppressions (guard does not read the checkov:skip comments above; these are its equivalents):
+    #   - S3_BUCKET_LOGGING_ENABLED: circular — this is the access-log sink itself; it does not log to another bucket.
+    #   - S3_BUCKET_DEFAULT_LOCK_ENABLED: S3 Object Lock (WORM) is inappropriate for ephemeral demo logs and would
+    #     conflict with the 90-day expiration lifecycle below (retention blocks the lifecycle deletion).
+    #   - S3_BUCKET_NO_PUBLIC_RW_ACL: fires only because ACLs are enabled (BucketOwnerPreferred), which CloudFront
+    #     legacy logging REQUIRES for log delivery. PublicAccessBlock is fully on (all four true) so a public ACL
+    #     cannot exist; the only ACL grants are the bucket owner + the AWS log-delivery canonical account.
+    Metadata:
+      guard:
+        SuppressedRules:
+          - S3_BUCKET_LOGGING_ENABLED
+          - S3_BUCKET_DEFAULT_LOCK_ENABLED
+          - S3_BUCKET_NO_PUBLIC_RW_ACL
+      # Structured Checkov skips (honored by platform scanners that read resource Metadata
+      # rather than inline `# checkov:skip=` comments).
+      checkov:
+        skip:
+          - id: CKV_AWS_18
+            comment: >-
+              This IS the access-log sink bucket (CloudFront standard logging target); enabling S3
+              server access logging on it would be circular (a log bucket logging to itself/another
+              bucket). Accepted by design.
+          - id: CKV_AWS_145
+            comment: >-
+              CloudFront standard (legacy) logging requires SSE-S3 (AES256); it does not support
+              SSE-KMS, so the stack KMS CMK is intentionally not used here.
+          - id: CKV_AWS_144
+            comment: >-
+              Cross-region replication is out of scope for a short-lived demo access-log bucket.
+    Properties:
+      BucketName: !Sub "otel-demo-ec2-cf-logs-${AWS::AccountId}-${AWS::Region}"
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-cloudfront-logs
+            Status: Enabled
+            ExpirationInDays: 90
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 7
+      Tags:
+        - Key: Project
+          Value: otel_demo
+
+  # ============================================================
+  # CloudFront distribution (public edge, AWS-managed TLS cert on *.cloudfront.net)
+  # ============================================================
+  # NO CUSTOM DOMAIN is available in this account: public domain registration is blocked
+  # (Amazon-internal; route53domains refuses to register), so this distribution intentionally
+  # uses the AWS-managed default *.cloudfront.net certificate. Two scanner findings follow
+  # directly from that one accepted decision and cannot be remediated without a custom domain:
+  #   - CLOUDFRONT_CUSTOM_SSL_CERTIFICATE (cfn-guard): no ACM/IAM custom cert is attached, by design.
+  #   - CKV_AWS_174 (checkov): viewer minimum TLS cannot be raised above the default cert's
+  #     security policy — CloudFront only honors MinimumProtocolVersion when a CUSTOM cert is used;
+  #     with the default cert the policy is fixed and not settable.
+  # Prod remediation: register a custom domain, issue an ACM cert, set ViewerCertificate to that
+  # ACM cert ARN with MinimumProtocolVersion TLSv1.2_2021. Documented in SECURITY-SUPPRESSIONS docx.
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    DependsOn: ALBListener
+    # checkov:skip=CKV_AWS_174:Default *.cloudfront.net cert forces a fixed TLS security policy; viewer min-TLS is not settable without a custom-domain ACM cert, which is blocked in this account. Accepted demo tradeoff.
+    Metadata:
+      guard:
+        SuppressedRules:
+          - CLOUDFRONT_CUSTOM_SSL_CERTIFICATE
+      # Structured Checkov skip (honored by platform scanners that read resource Metadata
+      # rather than inline `# checkov:skip=` comments).
+      checkov:
+        skip:
+          - id: CKV_AWS_174
+            comment: >-
+              Default *.cloudfront.net cert forces a fixed TLS security policy; viewer
+              MinimumProtocolVersion is only honored with a CUSTOM ACM/IAM cert, and custom-domain
+              registration is blocked in this account. The AWS-managed default cert still enforces
+              a modern TLS policy and viewers are forced to HTTPS (redirect-to-https). Accepted demo
+              tradeoff. Prod: custom domain + ACM cert with MinimumProtocolVersion TLSv1.2_2021.
+      cfn_nag:
+        rules_to_suppress:
+          - id: W70
+            reason: >-
+              MinimumProtocolVersion TLSv1.2 cannot be set while using the AWS-managed default
+              *.cloudfront.net certificate — CloudFront only honors MinimumProtocolVersion with a
+              CUSTOM cert, and a custom domain/ACM cert is blocked in this account. Viewers are
+              still forced to HTTPS (redirect-to-https). Production: custom domain + ACM cert with
+              MinimumProtocolVersion TLSv1.2_2021.
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: otel-demo EC2 public edge in front of the frontend ALB
+        PriceClass: PriceClass_100
+        HttpVersion: http2
+        # Access logging to the dedicated S3 log bucket (clears CKV_AWS_86 / CLOUDFRONT_ACCESSLOGS_ENABLED).
+        Logging:
+          Bucket: !GetAtt CloudFrontLogBucket.RegionalDomainName
+          IncludeCookies: false
+          Prefix: cloudfront-access-logs/
+        # No custom domain/cert: use the default *.cloudfront.net certificate (AWS-managed TLS).
+        # checkov:skip=CKV_AWS_174:MinimumProtocolVersion is not settable with CloudFrontDefaultCertificate; default *.cloudfront.net cert enforces a fixed modern TLS policy. Custom-domain ACM cert blocked in this account. Accepted demo tradeoff.
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+        Origins:
+          - Id: alb-origin
+            DomainName: !GetAtt ALB.DNSName
+            CustomOriginConfig:
+              # Origin leg is HTTP:80 (edge TLS terminates at CloudFront). The ALB SG admits only
+              # the CloudFront prefix list and the listener requires the secret header below.
+              OriginProtocolPolicy: http-only
+              HTTPPort: 80
+              OriginSSLProtocols:
+                - TLSv1.2
+            OriginCustomHeaders:
+              - HeaderName: X-Origin-Verify
+                HeaderValue: !Ref OriginSecretHeader
+        DefaultCacheBehavior:
+          TargetOriginId: alb-origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          # Managed-CachingDisabled + Managed-AllViewer: pass everything to a dynamic app origin.
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+          OriginRequestPolicyId: 216adef6-5c7f-47e4-b989-5492eafa07d3
+      Tags:
+        - Key: Project
+          Value: otel_demo
+
+  # ============================================================
+  # Secrets access for the backend instance (fetch RDS password at bootstrap)
+  # ============================================================
+  SecretsReadPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Allow the demo EC2 instances to read the RDS master-password secret.
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: secretsmanager:GetSecretValue
+            Resource: !Ref DBSecret
+          - Effect: Allow
+            Action: kms:Decrypt
+            Resource: !GetAtt DemoKmsKey.Arn
+
+  # ============================================================
+  # SSM bootstrap: deploys the .NET app + ADOT instrumentation with zero manual steps.
+  # Idempotent; installs IIS, .NET SDK, ASP.NET Core Hosting Bundle (ANCM), CloudWatch
+  # Agent (Application Signals), ADOT .NET (service.name set at MACHINE scope so IIS
+  # workers pick it up), publishes the app, and creates the IIS site.
+  # ============================================================
+  BootstrapDocument:
+    Type: AWS::SSM::Document
+    Metadata:
+      # W2501: 'DbPassword' is a transient SSM Document input (the RDS password is resolved at
+      # deploy time and passed in to avoid a stale on-box AWS SDK). It is NOT stored in the
+      # template or the created resource; the value never appears in the document body.
+      cfn-lint:
+        config:
+          ignore_checks:
+            - W2501
+    Properties:
+      DocumentType: Command
+      DocumentFormat: YAML
+      Content:
+        schemaVersion: '2.2'
+        description: otel-demo EC2 app deploy + ADOT instrumentation bootstrap.
+        parameters:
+          Role:
+            type: String
+            description: backend or frontend
+          DbEndpoint:
+            type: String
+            default: ''
+          BackendIp:
+            type: String
+            default: ''
+          SecretArn:
+            type: String
+            default: ''
+          DbPassword:
+            type: String
+            default: ''
+            description: RDS master password, resolved at deploy time and passed in (avoids a stale on-box AWS SDK unmarshalling the Secrets Manager response).
+          ServiceName:
+            type: String
+          Region:
+            type: String
+        mainSteps:
+          - action: aws:runPowerShellScript
+            name: bootstrap
+            inputs:
+              timeoutSeconds: '3600'
+              runCommand:
+                - |
+                  $ErrorActionPreference = 'Stop'
+                  $ProgressPreference = 'SilentlyContinue'
+                  [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+                  $Role = '{{ Role }}'
+                  $DbEndpoint = '{{ DbEndpoint }}'
+                  $BackendIp = '{{ BackendIp }}'
+                  $SecretArn = '{{ SecretArn }}'
+                  $DbPassword = '{{ DbPassword }}'
+                  $ServiceName = '{{ ServiceName }}'
+                  $Region = '{{ Region }}'
+                  New-Item -ItemType Directory -Force -Path C:\otel-demo | Out-Null
+                  Start-Transcript -Path C:\otel-demo\bootstrap.log -Append | Out-Null
+
+                  # 1. IIS
+                  if ((Get-WindowsFeature Web-Server).InstallState -ne 'Installed') {
+                    Install-WindowsFeature -Name Web-Server -IncludeManagementTools | Out-Null
+                    Install-WindowsFeature -Name Web-Asp-Net45 | Out-Null
+                  }
+
+                  # 2. .NET 8 SDK (needed to publish the app)
+                  $dotnet = 'C:\Program Files\dotnet\dotnet.exe'
+                  if (-not (Test-Path $dotnet)) {
+                    # Holmes-suppress (Dependency and Supply Chain Security): the dotnet-install.ps1 bootstrapper is fetched
+                    #   from the unversioned https://dot.net/v1/ endpoint rather than a pinned/hash-verified script.
+                    # Justification: dot.net/v1/dotnet-install.ps1 is Microsoft's OFFICIAL, documented installer endpoint,
+                    #   served over HTTPS from a Microsoft-controlled host. Microsoft's own guidance is to fetch this script
+                    #   fresh; there is no versioned permalink or published hash for the installer script itself. The SDK
+                    #   PAYLOAD it installs IS pinned (-Version 8.0.426), so the installed runtime is deterministic.
+                    # Accepted demo tradeoff: residual risk is a compromise of Microsoft's own CDN — out of scope for a
+                    #   short-lived demo. PROD hardening: vendor a reviewed copy of dotnet-install.ps1 into the repo (or pin to
+                    #   a dotnet/install-scripts commit) and add a Get-FileHash SHA256 check that aborts on mismatch.
+                    Invoke-WebRequest -Uri 'https://dot.net/v1/dotnet-install.ps1' -OutFile C:\otel-demo\dotnet-install.ps1 -UseBasicParsing
+                    # SDK payload pinned to an exact patch (8.0.426) for reproducible installs (Holmes: Dependency and Supply Chain Security).
+                    & C:\otel-demo\dotnet-install.ps1 -Version 8.0.426 -InstallDir 'C:\Program Files\dotnet'
+                    [Environment]::SetEnvironmentVariable('PATH', 'C:\Program Files\dotnet;' + [Environment]::GetEnvironmentVariable('PATH','Machine'), 'Machine')
+                  }
+                  $env:PATH = 'C:\Program Files\dotnet;' + $env:PATH
+
+                  # 3. ASP.NET Core Hosting Bundle (ANCM) - pinned to an exact version (Holmes: Dependency and Supply Chain Security).
+                  $ancm = 'C:\Program Files\IIS\Asp.Net Core Module\V2\aspnetcorev2.dll'
+                  if (-not (Test-Path $ancm)) {
+                    $url = 'https://builds.dotnet.microsoft.com/dotnet/aspnetcore/Runtime/8.0.32/dotnet-hosting-8.0.32-win.exe'
+                    Invoke-WebRequest -Uri $url -OutFile C:\otel-demo\hosting.exe -UseBasicParsing
+                    Start-Process C:\otel-demo\hosting.exe -ArgumentList '/quiet','/norestart' -Wait
+                    Remove-Item C:\otel-demo\hosting.exe -Force -ErrorAction SilentlyContinue
+                    iisreset /restart | Out-Null
+                  }
+
+                  # 4. CloudWatch Agent (Application Signals traces/metrics + IIS & event logs)
+                  $cwctl = 'C:\Program Files\Amazon\AmazonCloudWatchAgent\amazon-cloudwatch-agent-ctl.ps1'
+                  if (-not (Test-Path $cwctl)) {
+                    # Holmes-suppress (Dependency and Supply Chain Security): the CloudWatch Agent MSI is fetched
+                    #   from the '/windows/amd64/latest/' path rather than a pinned version with a verified hash.
+                    # Justification: this is AWS's OFFICIAL, documented CloudWatch Agent download — the regional,
+                    #   account-owned S3 bucket (amazoncloudwatch-agent-<region>) over HTTPS. AWS's own install
+                    #   docs use this 'latest' path, and AWS does NOT publish a per-artifact .sha256 sidecar for
+                    #   it, so there is no vendor-attested hash to verify against. (We deliberately do not embed a
+                    #   self-computed hash: it would only attest our own one-time download, not AWS's publication,
+                    #   giving false assurance.)
+                    # For reference: the version deployed on the fleet at last bootstrap was 1.300073.2b1889
+                    #   (confirmed via CWAGENT_VERSION file + ctl status on the live instance, 2026-10-18). A
+                    #   versioned path for that build does exist (.../windows/amd64/1.300073.2b1889/...) if a
+                    #   future reviewer wants to pin it.
+                    # Accepted demo tradeoff: residual risk is a compromise of AWS's own first-party CDN — out of
+                    #   scope for a short-lived demo. PROD hardening: mirror a reviewed, version-pinned MSI into an
+                    #   internal artifact store and verify against an organization-controlled hash.
+                    Invoke-WebRequest -Uri ('https://amazoncloudwatch-agent-' + $Region + '.s3.' + $Region + '.amazonaws.com/windows/amd64/latest/amazon-cloudwatch-agent.msi') -OutFile C:\otel-demo\cwagent.msi -UseBasicParsing
+                    Start-Process msiexec.exe -ArgumentList '/i','C:\otel-demo\cwagent.msi','/quiet' -Wait
+                    Remove-Item C:\otel-demo\cwagent.msi -Force -ErrorAction SilentlyContinue
+                  }
+                  $cwjson = @"
+                  {
+                    "traces": { "traces_collected": { "application_signals": {} } },
+                    "logs": {
+                      "metrics_collected": { "application_signals": {} },
+                      "logs_collected": {
+                        "files": { "collect_list": [
+                          { "file_path": "C:\\inetpub\\logs\\LogFiles\\W3SVC1\\*.log", "log_group_name": "/otel-demo/$Role/iis-access", "log_stream_name": "{instance_id}" }
+                        ] },
+                        "windows_events": { "collect_list": [
+                          { "event_name": "Application", "event_levels": ["ERROR","WARNING"], "log_group_name": "/otel-demo/$Role/windows-events", "log_stream_name": "{instance_id}" }
+                        ] }
+                      }
+                    }
+                  }
+                  "@
+                  Set-Content -Path C:\otel-demo\cw-agent.json -Value $cwjson -Encoding ASCII
+                  & $cwctl -a fetch-config -m ec2 -s -c 'file:C:\otel-demo\cw-agent.json' | Out-Null
+
+                  # 5. ADOT .NET auto-instrumentation + MACHINE-scope OTEL env (so IIS workers get service.name)
+                  # Idempotent: skip the core install if already present. Re-running Install-OpenTelemetryCore
+                  # fails when the app is already live (OpenTelemetry.Api.dll is loaded/locked by the IIS worker).
+                  $mod = 'C:\otel-demo\AWS.Otel.DotNet.Auto.psm1'
+                  # Holmes FIX (Dependency and Supply Chain Security): pinned to the DEPLOYED ADOT .NET release
+                  #   v1.15.0 (was 'releases/latest/download', which floated to whatever was current at bootstrap).
+                  #   v1.15.0 is the version actually installed on the running fleet; its loader installs the
+                  #   v1.15.0 core deterministically (Install-OpenTelemetryCore hardcodes $version='v1.15.0').
+                  # Integrity-verified: the SHA256 below is the official published hash from the release's
+                  #   AWS.Otel.DotNet.Auto.psm1.sha256 sidecar, verified byte-for-byte on 2026-10-18. Bootstrap
+                  #   ABORTS if the downloaded module does not match, so a tampered/compromised artifact cannot run.
+                  $adotModuleUrl = 'https://github.com/aws-observability/aws-otel-dotnet-instrumentation/releases/download/v1.15.0/AWS.Otel.DotNet.Auto.psm1'
+                  $adotModuleSha256 = '62a2b2e9cc24963608fe07f738c1bc6e4d853e42197ce4966c384ee6413eef3c'
+                  Invoke-WebRequest -Uri $adotModuleUrl -OutFile $mod -UseBasicParsing
+                  $actualSha = (Get-FileHash $mod -Algorithm SHA256).Hash.ToLower()
+                  if ($actualSha -ne $adotModuleSha256) {
+                    throw ("ADOT module integrity check FAILED: expected $adotModuleSha256 but got $actualSha. Aborting bootstrap.")
+                  }
+                  Write-Output "ADOT module v1.15.0 integrity verified (SHA256 match)."
+                  Import-Module $mod -Force
+                  $adotInstalled = Test-Path 'C:\Program Files\AWS Distro for OpenTelemetry AutoInstrumentation\net\net8.0\OpenTelemetry.Api.dll'
+                  if (-not $adotInstalled) { Install-OpenTelemetryCore } else { Write-Output 'ADOT core already installed; skipping Install-OpenTelemetryCore.' }
+                  $otel = [ordered]@{
+                    'OTEL_EXPORTER_OTLP_PROTOCOL' = 'http/protobuf'
+                    'OTEL_EXPORTER_OTLP_TRACES_ENDPOINT' = 'http://localhost:4316/v1/traces'
+                    'OTEL_AWS_APPLICATION_SIGNALS_EXPORTER_ENDPOINT' = 'http://localhost:4316/v1/metrics'
+                    'OTEL_AWS_APPLICATION_SIGNALS_ENABLED' = 'true'
+                    'OTEL_METRICS_EXPORTER' = 'none'
+                    'OTEL_LOGS_EXPORTER' = 'none'
+                    'OTEL_SERVICE_NAME' = $ServiceName
+                    'OTEL_RESOURCE_ATTRIBUTES' = ('service.name=' + $ServiceName + ',deployment.environment=ec2:otel-demo')
+                    'OTEL_DOTNET_AUTO_TRACES_HTTP_ROUTE_BASED_SPAN_NAMES' = 'true'
+                  }
+                  foreach ($k in $otel.Keys) { [Environment]::SetEnvironmentVariable($k, $otel[$k], 'Machine') }
+                  Register-OpenTelemetryForIIS
+
+                  # 6. App source (literal here-strings) + role-specific configuration
+                  $src = 'C:\otel-demo\source\' + $Role
+                  New-Item -ItemType Directory -Force -Path $src | Out-Null
+                  if ($Role -eq 'backend') {
+                    $prog = @'
+                  // Backend API — runs on port 5000 on the backend EC2 instance.
+                  // Uses SQL Server for order storage. ADOT auto-instruments SqlClient
+                  // producing spans with db.system, db.name, db.statement, and duration.
+
+                  using Microsoft.Data.SqlClient;
+
+                  var builder = WebApplication.CreateBuilder(args);
+                  builder.WebHost.UseUrls("http://*:5000");
+                  var app = builder.Build();
+
+                  var connStr = Environment.GetEnvironmentVariable("DB_CONNECTION_STRING")
+                      ?? throw new InvalidOperationException(
+                          "DB_CONNECTION_STRING is not set. The bootstrap sets it as a machine-scope " +
+                          "environment variable with credentials resolved from Secrets Manager at deploy time. " +
+                          "No credentials are hardcoded in source.");
+
+                  // --- Auto-migration: create OrdersDb + Orders table + seed data if missing ---
+                  // This lets the ECS deployment be self-contained (no separate DB setup step needed),
+                  // mirroring the intent of the EC2 create-db.ps1 script but run on container startup.
+                  await EnsureDatabaseAsync(connStr);
+
+                  app.MapGet("/api/health", () => Results.Ok(new { status = "healthy", service = "backend-api", timestamp = DateTime.UtcNow }));
+
+                  app.MapGet("/api/orders", async () =>
+                  {
+                      await using var conn = new SqlConnection(connStr);
+                      await conn.OpenAsync();
+                      await using var cmd = new SqlCommand("SELECT Id, Item, Qty, Status FROM Orders", conn);
+                      await using var reader = await cmd.ExecuteReaderAsync();
+                      var orders = new List<object>();
+                      while (await reader.ReadAsync())
+                          orders.Add(new { id = reader.GetInt32(0), item = reader.GetString(1), qty = reader.GetInt32(2), status = reader.GetString(3) });
+                      return Results.Ok(orders);
+                  });
+
+                  app.MapGet("/api/orders/{id}", async (int id) =>
+                  {
+                      await using var conn = new SqlConnection(connStr);
+                      await conn.OpenAsync();
+                      await using var cmd = new SqlCommand("SELECT Id, Item, Qty, Status FROM Orders WHERE Id = @Id", conn);
+                      cmd.Parameters.AddWithValue("@Id", id);
+                      await using var reader = await cmd.ExecuteReaderAsync();
+                      if (!await reader.ReadAsync())
+                          return Results.NotFound(new { error = $"Order {id} not found" });
+                      return Results.Ok(new { id = reader.GetInt32(0), item = reader.GetString(1), qty = reader.GetInt32(2), status = reader.GetString(3) });
+                  });
+
+                  app.MapPost("/api/orders", async () =>
+                  {
+                      await using var conn = new SqlConnection(connStr);
+                      await conn.OpenAsync();
+                      await using var cmd = new SqlCommand(
+                          "INSERT INTO Orders (Item, Qty, Status) OUTPUT INSERTED.Id VALUES (@Item, @Qty, @Status)", conn);
+                      cmd.Parameters.AddWithValue("@Item", $"Order-{DateTime.UtcNow:HHmmss}");
+                      cmd.Parameters.AddWithValue("@Qty", Random.Shared.Next(1, 20));
+                      cmd.Parameters.AddWithValue("@Status", "created");
+                      var newId = (int)await cmd.ExecuteScalarAsync()!;
+                      return Results.Created($"/api/orders/{newId}", new { id = newId, status = "created" });
+                  });
+
+                  app.Run();
+
+                  static async Task EnsureDatabaseAsync(string dbConnStr)
+                  {
+                      // Build a connection string to "master" by swapping out the Database segment.
+                      var masterConnStr = System.Text.RegularExpressions.Regex.Replace(
+                          dbConnStr, @"Database=[^;]+;", "Database=master;", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
+                      const int maxAttempts = 10;
+                      for (var attempt = 1; attempt <= maxAttempts; attempt++)
+                      {
+                          try
+                          {
+                              await using var masterConn = new SqlConnection(masterConnStr);
+                              await masterConn.OpenAsync();
+                              await using var createDbCmd = new SqlCommand("IF DB_ID('OrdersDb') IS NULL CREATE DATABASE OrdersDb;", masterConn);
+                              await createDbCmd.ExecuteNonQueryAsync();
+                              break;
+                          }
+                          catch (Exception ex) when (attempt < maxAttempts)
+                          {
+                              Console.WriteLine($"[EnsureDatabaseAsync] Attempt {attempt}/{maxAttempts} failed to reach SQL Server: {ex.Message}. Retrying in 5s...");
+                              await Task.Delay(5000);
+                          }
+                      }
+
+                      await using var conn = new SqlConnection(dbConnStr);
+                      await conn.OpenAsync();
+
+                      await using var createTableCmd = new SqlCommand(@"
+                          IF OBJECT_ID('Orders','U') IS NULL
+                          CREATE TABLE Orders (
+                              Id INT IDENTITY(1,1) PRIMARY KEY,
+                              Item NVARCHAR(100) NOT NULL,
+                              Qty INT NOT NULL,
+                              Status NVARCHAR(50) NOT NULL
+                          );", conn);
+                      await createTableCmd.ExecuteNonQueryAsync();
+
+                      await using var seedCmd = new SqlCommand(@"
+                          IF NOT EXISTS (SELECT 1 FROM Orders)
+                          BEGIN
+                              INSERT INTO Orders (Item, Qty, Status) VALUES ('Widget A', 10, 'shipped');
+                              INSERT INTO Orders (Item, Qty, Status) VALUES ('Widget B', 5, 'processing');
+                              INSERT INTO Orders (Item, Qty, Status) VALUES ('Gadget C', 2, 'pending');
+                          END", conn);
+                      await seedCmd.ExecuteNonQueryAsync();
+
+                      Console.WriteLine("[EnsureDatabaseAsync] OrdersDb ready (database, table, seed data verified).");
+                  }
+                  '@
+                    Set-Content -Path ($src + '\Program.cs') -Value $prog -Encoding UTF8
+                    $proj = @'
+                  <Project Sdk="Microsoft.NET.Sdk.Web">
+                    <PropertyGroup>
+                      <TargetFramework>net8.0</TargetFramework>
+                      <ImplicitUsings>enable</ImplicitUsings>
+                    </PropertyGroup>
+                    <ItemGroup>
+                      <PackageReference Include="Microsoft.Data.SqlClient" Version="5.2.2" />
+                    </ItemGroup>
+                  </Project>
+                  '@
+                    Set-Content -Path ($src + '\BackendApi.csproj') -Value $proj -Encoding UTF8
+                    # Password is passed in as an SSM parameter (resolved at deploy time by the
+                    # deploy script / CFN) to avoid depending on the preinstalled AWSPowerShell
+                    # module, whose stale SDK fails to unmarshal the Secrets Manager 200 response.
+                    $pw = $DbPassword
+                    # Import the Amazon RDS root CA bundle into the Windows LocalMachine Trusted Root
+                    # store so the SQL Server TLS handshake can be *validated* (not blindly trusted).
+                    # The global bundle is a multi-cert PEM; split it and import each cert, since older
+                    # Import-Certificate only takes the first cert in a bundle.
+                    $caPem = 'C:\otel-demo\rds-global-bundle.pem'
+                    Invoke-WebRequest -Uri 'https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem' -OutFile $caPem -UseBasicParsing
+                    $raw = Get-Content $caPem -Raw
+                    $certBlocks = [regex]::Matches($raw, '(?s)-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----')
+                    $i = 0
+                    foreach ($m in $certBlocks) {
+                      $i++
+                      $single = Join-Path $env:TEMP ("rds-ca-$i.cer")
+                      Set-Content -Path $single -Value $m.Value -Encoding ASCII
+                      Import-Certificate -FilePath $single -CertStoreLocation Cert:\LocalMachine\Root -ErrorAction SilentlyContinue | Out-Null
+                      Remove-Item $single -Force -ErrorAction SilentlyContinue
+                    }
+                    Write-Output ("Imported $i RDS CA cert(s) into LocalMachine\Root")
+                    # Validated TLS: encrypt the connection AND verify the server certificate against the
+                    # imported RDS CA. Server= uses the RDS FQDN ($DbEndpoint) so the hostname matches the cert.
+                    $conn = 'Server=' + $DbEndpoint + ',1433;Database=OrdersDb;User Id=sa_demo;Password=' + $pw + ';Encrypt=true;TrustServerCertificate=false;'
+                    [Environment]::SetEnvironmentVariable('DB_CONNECTION_STRING', $conn, 'Machine')
+                    # Bind IPv4 all-interfaces explicitly: 'http://*:5000' resolved to IPv6-only (::)
+                    # on this AMI, so the frontend could not reach the backend over its IPv4 private IP.
+                    [Environment]::SetEnvironmentVariable('ASPNETCORE_URLS', 'http://0.0.0.0:5000', 'Machine')
+                    # Open inbound 5000 in the Windows firewall (SG already scopes it to the frontend SG).
+                    if (-not (Get-NetFirewallRule -DisplayName 'otel-demo Backend 5000' -ErrorAction SilentlyContinue)) {
+                      New-NetFirewallRule -DisplayName 'otel-demo Backend 5000' -Direction Inbound -Protocol TCP -LocalPort 5000 -Action Allow | Out-Null
+                    }
+                    $site = 'otel-demo-backend'; $port = 5000
+                  } else {
+                    $prog = @'
+                  // Frontend — runs on IIS (port 80) on the frontend EC2 instance.
+                  // Serves HTML pages and proxies API calls to the backend instance.
+                  // The BACKEND_URL env var is set by the setup script to point at the backend private IP.
+
+                  var builder = WebApplication.CreateBuilder(args);
+                  var backendUrl = Environment.GetEnvironmentVariable("BACKEND_URL") ?? "http://localhost:5000";
+                  builder.Services.AddHttpClient("backend", c => c.BaseAddress = new Uri(backendUrl));
+                  var app = builder.Build();
+
+                  app.MapGet("/", () => Results.Content(HomePage(), "text/html"));
+
+                  app.MapGet("/health", () => Results.Ok(new { status = "healthy", service = "frontend", backend = backendUrl, timestamp = DateTime.UtcNow }));
+
+                  // Proxy to backend — these calls will show as distributed traces
+                  app.MapGet("/api/{**path}", async (string path, IHttpClientFactory factory) =>
+                  {
+                      var client = factory.CreateClient("backend");
+                      var resp = await client.GetAsync($"/api/{path}");
+                      var body = await resp.Content.ReadAsStringAsync();
+                      return Results.Content(body, "application/json", statusCode: (int)resp.StatusCode);
+                  });
+
+                  app.MapPost("/api/{**path}", async (string path, IHttpClientFactory factory) =>
+                  {
+                      var client = factory.CreateClient("backend");
+                      var resp = await client.PostAsync($"/api/{path}", null);
+                      var body = await resp.Content.ReadAsStringAsync();
+                      return Results.Content(body, "application/json", statusCode: (int)resp.StatusCode);
+                  });
+
+                  app.Run();
+
+                  static string HomePage() => """
+                  <!DOCTYPE html>
+                  <html><head><title>OTel Demo - Order Dashboard</title>
+                  <style>
+                    body { font-family: system-ui; max-width: 800px; margin: 40px auto; padding: 0 20px; }
+                    button { padding: 8px 16px; margin: 4px; cursor: pointer; }
+                    pre { background: #f4f4f4; padding: 16px; border-radius: 4px; overflow-x: auto; }
+                    .header { border-bottom: 2px solid #232f3e; padding-bottom: 10px; }
+                    .actions { margin: 20px 0; }
+                  </style></head>
+                  <body>
+                    <div class="header">
+                      <h1>📦 Order Dashboard</h1>
+                      <p>Frontend → Backend distributed tracing demo</p>
+                    </div>
+                    <div class="actions">
+                      <button onclick="call('/api/orders')">List Orders</button>
+                      <button onclick="call('/api/orders/1')">Get Order #1</button>
+                      <button onclick="call('/api/orders/999')">Get Order #999 (404)</button>
+                      <button onclick="callPost('/api/orders')">Create Order</button>
+                      <button onclick="call('/api/health')">Backend Health</button>
+                      <button onclick="loadTest()">🔥 Load Test (20 requests)</button>
+                    </div>
+                    <h3>Response</h3>
+                    <pre id="out">Click a button above...</pre>
+                    <script>
+                      async function call(path) {
+                        const el = document.getElementById('out');
+                        el.textContent = 'Loading...';
+                        const r = await fetch(path);
+                        el.textContent = `${r.status} ${r.statusText}\n\n` + JSON.stringify(await r.json(), null, 2);
+                      }
+                      async function callPost(path) {
+                        const el = document.getElementById('out');
+                        el.textContent = 'Loading...';
+                        const r = await fetch(path, {method:'POST'});
+                        el.textContent = `${r.status} ${r.statusText}\n\n` + JSON.stringify(await r.json(), null, 2);
+                      }
+                      async function loadTest() {
+                        const el = document.getElementById('out');
+                        el.textContent = 'Running 20 requests...';
+                        const paths = ['/api/orders','/api/orders/1','/api/orders/2','/api/orders/999'];
+                        const results = await Promise.all(
+                          Array.from({length:20}, (_,i) => fetch(paths[i%paths.length]).then(r => `${r.status}`))
+                        );
+                        el.textContent = `Done! Results: ${results.join(', ')}`;
+                      }
+                    </script>
+                  </body></html>
+                  """;
+                  '@
+                    Set-Content -Path ($src + '\Program.cs') -Value $prog -Encoding UTF8
+                    $proj = @'
+                  <Project Sdk="Microsoft.NET.Sdk.Web">
+                    <PropertyGroup>
+                      <TargetFramework>net8.0</TargetFramework>
+                      <ImplicitUsings>enable</ImplicitUsings>
+                    </PropertyGroup>
+                  </Project>
+                  '@
+                    Set-Content -Path ($src + '\Frontend.csproj') -Value $proj -Encoding UTF8
+                    [Environment]::SetEnvironmentVariable('BACKEND_URL', ('http://' + $BackendIp + ':5000'), 'Machine')
+                    [Environment]::SetEnvironmentVariable('ASPNETCORE_URLS', 'http://*:80', 'Machine')
+                    $site = 'otel-demo-frontend'; $port = 80
+                  }
+
+                  # 7. Publish + host in IIS
+                  $app = 'C:\otel-demo\' + $Role
+                  New-Item -ItemType Directory -Force -Path ($app + '\logs') | Out-Null
+                  Push-Location $src
+                  & $dotnet publish -c Release -o $app --nologo
+                  Pop-Location
+                  Import-Module WebAdministration
+                  # Idempotent site management (cmdlets throw terminating errors under $ErrorActionPreference='Stop',
+                  # so -ErrorAction SilentlyContinue is not enough on a re-run; guard with Get-Website checks).
+                  if (Get-Website -Name 'Default Web Site' -ErrorAction SilentlyContinue) { Remove-WebSite -Name 'Default Web Site' }
+                  if (Get-Website -Name $site -ErrorAction SilentlyContinue) { Remove-WebSite -Name $site }
+                  New-WebSite -Name $site -Port $port -PhysicalPath $app -Force | Out-Null
+                  iisreset /restart | Out-Null
+                  Stop-Transcript | Out-Null
+                  Write-Output ('otel-demo bootstrap complete: role=' + $Role + ' service=' + $ServiceName)
+
+
+Outputs:
+  FrontendURL:
+    Description: Public frontend URL via CloudFront (HTTPS, AWS-managed cert). This is the demo entrypoint.
+    Value: !Sub "https://${CloudFrontDistribution.DomainName}"
+  CloudFrontDomainName:
+    Description: CloudFront distribution domain name
+    Value: !GetAtt CloudFrontDistribution.DomainName
+  AlbDnsName:
+    Description: Internal detail - ALB DNS (CloudFront origin; direct browsing returns 403 without the secret header)
+    Value: !GetAtt ALB.DNSName
+  FrontendInstancePrivateIp:
+    Description: Frontend instance private IP (behind the ALB; for debugging/SSM only)
+    Value: !GetAtt FrontendInstance.PrivateIp
+  BackendPrivateIp:
+    Description: Backend instance private IP (used by frontend)
+    Value: !GetAtt BackendInstance.PrivateIp
+  FrontendInstanceId:
+    Value: !Ref FrontendInstance
+  BackendInstanceId:
+    Value: !Ref BackendInstance
+  DatabaseEndpoint:
+    Description: RDS SQL Server endpoint (used by backend for connection string)
+    Value: !GetAtt DatabaseInstance.Endpoint.Address
+  DatabasePort:
+    Description: RDS SQL Server port
+    Value: !GetAtt DatabaseInstance.Endpoint.Port

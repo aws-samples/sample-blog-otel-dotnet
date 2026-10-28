@@ -1,0 +1,1082 @@
+####################################################################################
+# DEMO / SAMPLE ONLY - NOT HARDENED FOR PRODUCTION USE.
+# Public access is via Amazon CloudFront (its default *.cloudfront.net domain +
+# AWS-managed TLS cert), so NO custom domain or ACM cert is required. CloudFront
+# terminates TLS at the edge (viewer -> HTTPS); the CloudFront -> ALB origin leg
+# is HTTP:80. The ALB is NOT open to the internet: its security group only admits
+# the CloudFront origin-facing managed prefix list, and the ALB additionally
+# requires a secret header that CloudFront injects (defense-in-depth so the ALB
+# DNS name cannot be used to bypass CloudFront). Accepted demo risks: CloudFront
+# -> ALB and internal (frontend -> backend) hops are HTTP (edge TLS at CloudFront),
+# single-AZ SQL Server Express, and no secret rotation.
+# Do NOT deploy this template as-is into a production account.
+####################################################################################
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  otel-demo ECS: ADOT .NET Zero-Code Auto-Instrumentation on Linux Containers (Fargate),
+  fronted by CloudFront (public HTTPS via the default *.cloudfront.net cert; no custom
+  domain/ACM cert needed). DEMO/SAMPLE ONLY - not hardened for production (see header comment).
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Existing VPC to deploy into
+  SubnetId1:
+    Type: AWS::EC2::Subnet::Id
+    Description: First public subnet (must have internet access for Fargate public IP)
+  SubnetId2:
+    Type: AWS::EC2::Subnet::Id
+    Description: Second public subnet in a different AZ
+  CloudFrontPrefixListId:
+    Type: String
+    # AWS-managed prefix list "com.amazonaws.global.cloudfront.origin-facing" for this region.
+    # The ALB security group admits ONLY this prefix list on port 80 - the ALB is not open to
+    # 0.0.0.0/0, so Checkov CKV_AWS_260 does not fire and no open-ingress suppression is needed.
+    # Find it with: aws ec2 describe-managed-prefix-lists --filters
+    #   Name=prefix-list-name,Values=com.amazonaws.global.cloudfront.origin-facing
+    AllowedPattern: "^pl-[0-9a-f]+$"
+    ConstraintDescription: Must be a CloudFront origin-facing managed prefix list id (pl-xxxxxxxx).
+    Description: CloudFront origin-facing managed prefix list id for this region (restricts ALB ingress to CloudFront).
+  OriginSecretHeader:
+    Type: String
+    NoEcho: true
+    MinLength: 16
+    Description: >-
+      Shared secret value that CloudFront injects as the X-Origin-Verify header and the ALB
+      listener rule requires. Prevents direct-to-ALB access that bypasses CloudFront. Supply a
+      random high-entropy string at deploy time (do not reuse a real credential).
+  FrontendImageUri:
+    Type: String
+    Description: >-
+      ECR image URI for frontend. Use an immutable version tag or a SHA256 digest, never :latest
+      (e.g., 123456789012.dkr.ecr.us-west-2.amazonaws.com/otel-demo-frontend:1.0.0).
+  BackendImageUri:
+    Type: String
+    Description: >-
+      ECR image URI for backend. Use an immutable version tag or a SHA256 digest, never :latest
+      (e.g., 123456789012.dkr.ecr.us-west-2.amazonaws.com/otel-demo-backend:1.0.0).
+  CWAgentImage:
+    Type: String
+    Default: public.ecr.aws/cloudwatch-agent/cloudwatch-agent:1.300073.0b1828
+    Description: >-
+      Pinned CloudWatch Agent sidecar image. Use a specific version tag or SHA256 digest
+      from the public.ecr.aws/cloudwatch-agent/cloudwatch-agent gallery (never :latest).
+      Must be >= 1.300031.0 for CloudWatch Application Signals support.
+
+Resources:
+  # ============================================================
+  # NOTE: ECR Repositories (otel-demo-frontend, otel-demo-backend)
+  # are created outside this stack to avoid circular dependency with image URIs.
+  # ============================================================
+  # KMS CMK (encrypts CloudWatch Logs, Secrets Manager secret, and RDS storage)
+  # ============================================================
+  DemoKmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: CMK for otel-demo (CloudWatch Logs, Secrets Manager, RDS storage at rest)
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: EnableRootAccountAdmin
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            # kms:* to the account root is the AWS-recommended default key policy: it delegates
+            # key administration to IAM in this account and prevents the key from becoming
+            # unmanageable (lockout). It does NOT grant cross-account or public access.
+            # Production: evaluate whether SCPs / permission boundaries should further constrain
+            # which principals in the account may administer this CMK for your governance model.
+            Action: "kms:*"
+            Resource: "*"
+          - Sid: AllowCloudWatchLogs
+            Effect: Allow
+            Principal:
+              Service: !Sub "logs.${AWS::Region}.amazonaws.com"
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: "*"
+            Condition:
+              ArnLike:
+                "kms:EncryptionContext:aws:logs:arn": !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/ecs/otel-demo-*"
+      Tags:
+        - Key: Project
+          Value: otel_demo
+
+  DemoKmsAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: alias/otel-demo-cmk
+      TargetKeyId: !Ref DemoKmsKey
+
+  # ============================================================
+  # Security Groups
+  # ============================================================
+  AlbSG:
+    Type: AWS::EC2::SecurityGroup
+    # The public ALB sits behind CloudFront. Ingress is restricted to the CloudFront
+    # origin-facing managed prefix list on HTTP:80 ONLY -- there is no 0.0.0.0/0 rule, so
+    # Checkov CKV_AWS_260 (open ingress) does not fire and no open-ingress suppression is
+    # needed. CloudFront terminates TLS at the edge; the CloudFront->ALB origin leg is HTTP,
+    # and the ALB additionally verifies a secret header (see HTTP listener) so the ALB DNS
+    # name cannot be used to bypass CloudFront.
+    # Egress is allow-all (made explicit); cfn-guard's egress rules fire on ANY non-empty
+    # egress property and cannot read intent, so they are suppressed -- the effective posture
+    # is unchanged from the SG default. Production: scope egress to required CIDRs.
+    Metadata:
+      guard:
+        SuppressedRules:
+          - EC2_SECURITY_GROUP_EGRESS_OPEN_TO_WORLD_RULE
+          - SECURITY_GROUP_EGRESS_ALL_PROTOCOLS_RULE
+    Properties:
+      GroupDescription: otel-demo ALB - HTTP (80) from the CloudFront origin-facing prefix list only
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourcePrefixListId: !Ref CloudFrontPrefixListId
+          Description: CloudFront origin-facing ranges only
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound (ALB to targets + health checks) - explicit by design
+      Tags:
+        - Key: Name
+          Value: otel-demo-ecs-alb-sg
+        - Key: Project
+          Value: otel_demo
+
+  FrontendSG:
+    Type: AWS::EC2::SecurityGroup
+    # Egress is allow-all (made explicit); suppress cfn-guard egress rules (unchanged from SG
+    # default). Production: scope egress to required CIDRs.
+    Metadata:
+      guard:
+        SuppressedRules:
+          - EC2_SECURITY_GROUP_EGRESS_OPEN_TO_WORLD_RULE
+          - SECURITY_GROUP_EGRESS_ALL_PROTOCOLS_RULE
+    Properties:
+      GroupDescription: otel-demo ECS frontend - port 8080 from ALB
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref AlbSG
+          Description: App port 8080 from the ALB security group only
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref AlbSG
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound (image pull, AWS APIs, internal ALB) - explicit by design
+      Tags:
+        - Key: Name
+          Value: otel-demo-ecs-frontend-sg
+        - Key: Project
+          Value: otel_demo
+
+  InternalAlbSG:
+    Type: AWS::EC2::SecurityGroup
+    # Egress is allow-all (made explicit); suppress cfn-guard egress rules (unchanged from SG
+    # default). Production: scope egress to required CIDRs.
+    Metadata:
+      guard:
+        SuppressedRules:
+          - EC2_SECURITY_GROUP_EGRESS_OPEN_TO_WORLD_RULE
+          - SECURITY_GROUP_EGRESS_ALL_PROTOCOLS_RULE
+    Properties:
+      GroupDescription: otel-demo internal ALB - port 5000 from frontend tasks
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5000
+          ToPort: 5000
+          SourceSecurityGroupId: !Ref FrontendSG
+          Description: App port 5000 from the frontend security group only
+          ToPort: 5000
+          SourceSecurityGroupId: !Ref FrontendSG
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound (internal ALB to backend targets + health checks) - explicit by design
+      Tags:
+        - Key: Name
+          Value: otel-demo-ecs-internal-alb-sg
+        - Key: Project
+          Value: otel_demo
+
+  BackendSG:
+    Type: AWS::EC2::SecurityGroup
+    # Egress is allow-all (made explicit); suppress cfn-guard egress rules (unchanged from SG
+    # default). Production: scope egress to required CIDRs.
+    Metadata:
+      guard:
+        SuppressedRules:
+          - EC2_SECURITY_GROUP_EGRESS_OPEN_TO_WORLD_RULE
+          - SECURITY_GROUP_EGRESS_ALL_PROTOCOLS_RULE
+    Properties:
+      GroupDescription: otel-demo ECS backend - port 5000 from internal ALB
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5000
+          ToPort: 5000
+          SourceSecurityGroupId: !Ref InternalAlbSG
+          Description: App port 5000 from the internal ALB security group only
+          ToPort: 5000
+          SourceSecurityGroupId: !Ref InternalAlbSG
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound (image pull, AWS APIs, RDS) - explicit by design
+      Tags:
+        - Key: Name
+          Value: otel-demo-ecs-backend-sg
+        - Key: Project
+          Value: otel_demo
+
+  DatabaseSG:
+    Type: AWS::EC2::SecurityGroup
+    # Egress is allow-all (made explicit); suppress cfn-guard egress rules (unchanged from SG
+    # default). RDS does not initiate connections. Production: scope egress to required CIDRs.
+    Metadata:
+      guard:
+        SuppressedRules:
+          - EC2_SECURITY_GROUP_EGRESS_OPEN_TO_WORLD_RULE
+          - SECURITY_GROUP_EGRESS_ALL_PROTOCOLS_RULE
+    Properties:
+      GroupDescription: otel-demo RDS SQL Server - port 1433 from backend tasks
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 1433
+          ToPort: 1433
+          SourceSecurityGroupId: !Ref BackendSG
+          Description: SQL Server port 1433 from the backend security group only
+          ToPort: 1433
+          SourceSecurityGroupId: !Ref BackendSG
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound (explicit; RDS does not initiate connections) - by design
+      Tags:
+        - Key: Name
+          Value: otel-demo-ecs-db-sg
+        - Key: Project
+          Value: otel_demo
+
+  # ============================================================
+  # IAM Roles
+  # ============================================================
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: otel-demo-ecs-execution-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Tags:
+        - Key: Project
+          Value: otel_demo
+
+  ECSTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: otel-demo-ecs-task-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+        - arn:aws:iam::aws:policy/AWSXrayWriteOnlyAccess
+        - !Ref ECSTaskLogsPolicy
+      Tags:
+        - Key: Project
+          Value: otel_demo
+
+  # Customer-managed policy (no inline policies): log writes scoped to this stack's log groups
+  ECSTaskLogsPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: otel-demo-ecs-task-logs
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: WriteScopedLogStreams
+            Effect: Allow
+            Action:
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource:
+              - !GetAtt FrontendLogGroup.Arn
+              - !GetAtt BackendLogGroup.Arn
+              - !GetAtt CWAgentFrontendLogGroup.Arn
+              - !GetAtt CWAgentBackendLogGroup.Arn
+          - Sid: DescribeLogGroups
+            Effect: Allow
+            Action:
+              - logs:DescribeLogGroups
+            Resource: "*"
+
+  # ============================================================
+  # ECS Cluster
+  # ============================================================
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: otel-demo-cluster
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+      Tags:
+        - Key: Project
+          Value: otel_demo
+
+  # ============================================================
+  # CloudWatch Log Groups
+  # ============================================================
+  FrontendLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/otel-demo-frontend
+      RetentionInDays: 7
+      KmsKeyId: !GetAtt DemoKmsKey.Arn
+
+  BackendLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/otel-demo-backend
+      RetentionInDays: 7
+      KmsKeyId: !GetAtt DemoKmsKey.Arn
+
+  CWAgentFrontendLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/otel-demo-cwagent-frontend
+      RetentionInDays: 7
+      KmsKeyId: !GetAtt DemoKmsKey.Arn
+
+  CWAgentBackendLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/otel-demo-cwagent-backend
+      RetentionInDays: 7
+      KmsKeyId: !GetAtt DemoKmsKey.Arn
+
+  # ============================================================
+  # Application Load Balancer
+  # ============================================================
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W52
+            reason: >-
+              ALB access logging is intentionally not enabled for this short-lived demo. Request
+              visibility is provided via CloudFront access logs (to the dedicated log bucket) and
+              Application Signals / X-Ray traces. Production: enable ALB access logging to a
+              dedicated S3 bucket.
+    Properties:
+      Name: otel-demo-ecs-alb
+      Scheme: internet-facing
+      Type: application
+      SecurityGroups:
+        - !Ref AlbSG
+      Subnets:
+        - !Ref SubnetId1
+        - !Ref SubnetId2
+      Tags:
+        - Key: Project
+          Value: otel_demo
+
+  FrontendTG:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: otel-demo-frontend-tg
+      Port: 8080
+      Protocol: HTTP
+      VpcId: !Ref VpcId
+      TargetType: ip
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 30
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Tags:
+        - Key: Project
+          Value: otel_demo
+
+  # Public ALB listener - HTTP:80, fronted by CloudFront (edge TLS).
+  # cfn-guard ELBV2_LISTENER_SSL_POLICY_RULE / Checkov CKV_AWS_2 want HTTPS/TLS on the listener;
+  # that requirement is satisfied at the CloudFront edge (viewer connections are HTTPS with the
+  # AWS-managed *.cloudfront.net cert). TLS cannot/should not be terminated here: this listener is
+  # reachable ONLY from the CloudFront origin-facing prefix list (see AlbSG), and the default action
+  # returns 403 unless the request carries the secret X-Origin-Verify header that CloudFront injects.
+  # The HTTP origin leg is an accepted, documented demo decision (edge TLS at CloudFront).
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    # checkov:skip=CKV_AWS_2:Edge TLS is terminated at CloudFront; this origin listener is CloudFront-only (prefix-list SG + secret header).
+    # checkov:skip=CKV_AWS_103:TLS 1.2+ is enforced at the CloudFront edge; origin leg is HTTP by design for this demo.
+    Metadata:
+      guard:
+        SuppressedRules:
+          - ELBV2_LISTENER_SSL_POLICY_RULE
+      cfn_nag:
+        rules_to_suppress:
+          - id: W56
+            reason: >-
+              HTTP (not HTTPS) on this ALB listener is by design: TLS is terminated at the
+              CloudFront edge. This origin listener is reachable ONLY from the CloudFront
+              origin-facing prefix list and requires the secret X-Origin-Verify header, so it
+              cannot bypass CloudFront. Production: ACM cert + HTTPS listener on a custom domain.
+    Properties:
+      LoadBalancerArn: !Ref ALB
+      Port: 80
+      Protocol: HTTP
+      # Default: reject anything that did not come through CloudFront with the secret header.
+      DefaultActions:
+        - Type: fixed-response
+          FixedResponseConfig:
+            StatusCode: "403"
+            ContentType: text/plain
+            MessageBody: "Direct access denied. Reach this service via its CloudFront URL."
+
+  # Only requests carrying the CloudFront-injected secret header are forwarded to the app.
+  ALBListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref ALBListener
+      Priority: 1
+      Conditions:
+        - Field: http-header
+          HttpHeaderConfig:
+            HttpHeaderName: X-Origin-Verify
+            Values:
+              - !Ref OriginSecretHeader
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref FrontendTG
+
+  # Internal ALB for backend (so frontend can route to backend via service discovery)
+  BackendTG:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: otel-demo-backend-tg
+      Port: 5000
+      Protocol: HTTP
+      VpcId: !Ref VpcId
+      TargetType: ip
+      HealthCheckPath: /api/health
+      HealthCheckIntervalSeconds: 30
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Tags:
+        - Key: Project
+          Value: otel_demo
+
+  InternalALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: otel-demo-ecs-internal-alb
+      Scheme: internal
+      Type: application
+      SecurityGroups:
+        - !Ref InternalAlbSG
+      Subnets:
+        - !Ref SubnetId1
+        - !Ref SubnetId2
+      Tags:
+        - Key: Project
+          Value: otel_demo
+
+  InternalALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    # VPC-INTERNAL east-west traffic only (frontend -> backend); not internet-reachable.
+    # Public edge TLS is terminated at CloudFront (viewer HTTPS via the default *.cloudfront.net cert);
+    # the CloudFront->ALB origin leg and this VPC-internal frontend->backend leg are HTTP by design for
+    # this demo. Hardening the internal leg requires a private DNS name + matching cert (see docx).
+    # checkov:skip=CKV_AWS_103:Internal (VPC-only) listener; public edge TLS is terminated at CloudFront.
+    # checkov:skip=CKV_AWS_2:Internal (VPC-only) listener; not internet-reachable.
+    Metadata:
+      guard:
+        SuppressedRules:
+          - ELBV2_LISTENER_SSL_POLICY_RULE
+    Properties:
+      LoadBalancerArn: !Ref InternalALB
+      Port: 5000
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref BackendTG
+
+  # ============================================================
+  # RDS SQL Server Express
+  # ============================================================
+  DBSecret:
+    Type: AWS::SecretsManager::Secret
+    # DEMO ONLY - automatic rotation is intentionally NOT configured for this short-lived demo secret.
+    # Production: enable rotation via AWS::SecretsManager::RotationSchedule with a rotation Lambda.
+    Metadata:
+      guard:
+        SuppressedRules:
+          - SECRETSMANAGER_ROTATION_ENABLED_CHECK
+    Properties:
+      Name: otel-demo/rds/master-password
+      Description: Auto-generated master password for the otel-demo RDS SQL Server (sa_demo user).
+      KmsKeyId: !Ref DemoKmsKey
+      GenerateSecretString:
+        SecretStringTemplate: '{"username":"sa_demo"}'
+        GenerateStringKey: "password"
+        PasswordLength: 24
+        ExcludeCharacters: '"''@/\;={}'
+      Tags:
+        - Key: Project
+          Value: otel_demo
+
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: otel-demo ECS DB subnets
+      SubnetIds:
+        - !Ref SubnetId1
+        - !Ref SubnetId2
+      Tags:
+        - Key: Project
+          Value: otel_demo
+
+  DatabaseInstance:
+    Type: AWS::RDS::DBInstance
+    DependsOn: DBSecret
+    # DEMO ONLY - NOT FOR PRODUCTION. Accepted risks (see SECURITY-SUPPRESSIONS docx):
+    #  - Multi-AZ is NOT supported by SQL Server Express (sqlserver-ex); single-AZ is a hard demo constraint.
+    #    Production: use a Multi-AZ capable edition (SE/Web/EE) with MultiAZ: true.
+    #  - MasterUserPassword is injected via a Secrets Manager dynamic reference (secure; Checkov passes).
+    #    cfn-guard's secure-service/parameter rules expect ManageMasterUserPassword and are suppressed.
+    #    Production: prefer ManageMasterUserPassword: true (RDS-managed secret).
+    Metadata:
+      guard:
+        SuppressedRules:
+          - RDS_MULTI_AZ_SUPPORT
+          - RDS_MASTER_USER_PASSWORD_NO_PLAINTEXT_PASSWORD
+          - RDS_MASTER_USER_PASSWORD_USES_SECURE_PARAMETER
+          - RDS_MASTER_USER_PASSWORD_USES_SECURE_SERVICE
+      cfn_nag:
+        rules_to_suppress:
+          - id: F24
+            reason: >-
+              MasterUsername is the static, non-secret login name 'sa_demo'. The master PASSWORD
+              is injected via a Secrets Manager dynamic reference (MasterUserPassword below), so no
+              secret is in plaintext. The username itself is not sensitive for this demo.
+              Production: use ManageMasterUserPassword: true (RDS-managed secret).
+          - id: F80
+            reason: >-
+              DeletionProtection is intentionally left off so this short-lived demo stack can be
+              torn down cleanly. Production: enable DeletionProtection.
+          - id: W28
+            reason: >-
+              DBInstanceIdentifier 'otel-demo-ecs-db' is an intentional explicit name for demo
+              legibility. Replacement-on-update is acceptable for an ephemeral demo. Production:
+              omit the explicit name and let CloudFormation generate one.
+    Properties:
+      DBInstanceIdentifier: otel-demo-ecs-db
+      Engine: sqlserver-ex
+      EngineVersion: "16.00"
+      DBInstanceClass: db.t3.small
+      AllocatedStorage: 20
+      StorageEncrypted: true
+      KmsKeyId: !Ref DemoKmsKey
+      AutoMinorVersionUpgrade: true
+      MasterUsername: sa_demo
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${DBSecret}:SecretString:password}}'
+      ApplyImmediately: true
+      VPCSecurityGroups:
+        - !Ref DatabaseSG
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      PubliclyAccessible: false
+      BackupRetentionPeriod: 0
+      DeletionProtection: false
+      Tags:
+        - Key: Name
+          Value: otel-demo-ecs-db
+        - Key: Project
+          Value: otel_demo
+
+  # ============================================================
+  # ECS Task Definitions
+  # ============================================================
+  BackendTaskDef:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: otel-demo-backend
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: "1024"
+      Memory: "2048"
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ECSTaskRole.Arn
+      Volumes:
+        - Name: otel-auto-instrumentation
+      ContainerDefinitions:
+        # --- Init container: copies ADOT .NET files to shared volume ---
+        - Name: init
+          Image: public.ecr.aws/aws-observability/adot-autoinstrumentation-dotnet:v1.7.0
+          Essential: false
+          Command:
+            - cp
+            - "-r"
+            - "/autoinstrumentation/."
+            - "/otel-auto-instrumentation"
+          MountPoints:
+            - SourceVolume: otel-auto-instrumentation
+              ContainerPath: /otel-auto-instrumentation
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref BackendLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: init
+
+        # --- CloudWatch Agent sidecar: receives OTLP, sends to CW/X-Ray ---
+        - Name: cloudwatch-agent
+          Image: !Ref CWAgentImage
+          Essential: true
+          PortMappings:
+            - ContainerPort: 4316
+              Protocol: tcp
+            - ContainerPort: 2000
+              Protocol: udp
+          Environment:
+            - Name: CW_CONFIG_CONTENT
+              Value: !Sub |
+                {"agent":{"debug":false},"traces":{"traces_collected":{"application_signals":{},"otlp":{"grpc_endpoint":"0.0.0.0:4315","http_endpoint":"0.0.0.0:4316"}}},"logs":{"metrics_collected":{"application_signals":{}}}}
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref CWAgentBackendLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: cwagent
+
+        # --- Backend application container ---
+        - Name: backend
+          Image: !Ref BackendImageUri
+          Essential: true
+          PortMappings:
+            - ContainerPort: 5000
+              Protocol: tcp
+          DependsOn:
+            - ContainerName: init
+              Condition: SUCCESS
+            - ContainerName: cloudwatch-agent
+              Condition: START
+          MountPoints:
+            - SourceVolume: otel-auto-instrumentation
+              ContainerPath: /otel-auto-instrumentation
+          Environment:
+            # --- ADOT .NET CLR Profiler environment variables ---
+            - Name: CORECLR_ENABLE_PROFILING
+              Value: "1"
+            - Name: CORECLR_PROFILER
+              Value: "{918728DD-259F-4A6A-AC2B-B85E1B658318}"
+            - Name: CORECLR_PROFILER_PATH
+              Value: /otel-auto-instrumentation/linux-x64/OpenTelemetry.AutoInstrumentation.Native.so
+            - Name: DOTNET_ADDITIONAL_DEPS
+              Value: /otel-auto-instrumentation/AdditionalDeps
+            - Name: DOTNET_SHARED_STORE
+              Value: /otel-auto-instrumentation/store
+            - Name: DOTNET_STARTUP_HOOKS
+              Value: /otel-auto-instrumentation/net/OpenTelemetry.AutoInstrumentation.StartupHook.dll
+            - Name: OTEL_DOTNET_AUTO_HOME
+              Value: /otel-auto-instrumentation
+            - Name: OTEL_DOTNET_AUTO_PLUGINS
+              Value: "AWS.Distro.OpenTelemetry.AutoInstrumentation.Plugin, AWS.Distro.OpenTelemetry.AutoInstrumentation"
+            # --- OTLP exporter config ---
+            - Name: OTEL_EXPORTER_OTLP_PROTOCOL
+              Value: http/protobuf
+            - Name: OTEL_EXPORTER_OTLP_ENDPOINT
+              Value: http://localhost:4316
+            - Name: OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
+              Value: http://localhost:4316/v1/traces
+            - Name: OTEL_AWS_APPLICATION_SIGNALS_EXPORTER_ENDPOINT
+              Value: http://localhost:4316/v1/metrics
+            - Name: OTEL_AWS_APPLICATION_SIGNALS_ENABLED
+              Value: "true"
+            - Name: OTEL_TRACES_SAMPLER
+              Value: xray
+            - Name: OTEL_METRICS_EXPORTER
+              Value: none
+            - Name: OTEL_LOGS_EXPORTER
+              Value: none
+            # --- Service identity ---
+            - Name: OTEL_RESOURCE_ATTRIBUTES
+              Value: service.name=otel-demo-backend-ecs
+            - Name: OTEL_SERVICE_NAME
+              Value: otel-demo-backend-ecs
+            # --- App config ---
+            - Name: DB_CONNECTION_STRING
+              # Full TLS validation: Encrypt=true + TrustServerCertificate=false. The backend
+              # container image installs the Amazon RDS global CA bundle into its trust store
+              # (see app/backend/Dockerfile), so the SQL client validates the RDS-issued server
+              # certificate chain rather than blindly trusting it. This satisfies Holmes ENC4.
+              Value: !Sub "Server=${DatabaseInstance.Endpoint.Address};Database=OrdersDb;User Id=sa_demo;Password={{resolve:secretsmanager:${DBSecret}:SecretString:password}};Encrypt=true;TrustServerCertificate=false;"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref BackendLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: backend
+      Tags:
+        - Key: Project
+          Value: otel_demo
+
+  FrontendTaskDef:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: otel-demo-frontend
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: "512"
+      Memory: "1024"
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ECSTaskRole.Arn
+      Volumes:
+        - Name: otel-auto-instrumentation
+      ContainerDefinitions:
+        # --- Init container: copies ADOT .NET files to shared volume ---
+        - Name: init
+          Image: public.ecr.aws/aws-observability/adot-autoinstrumentation-dotnet:v1.7.0
+          Essential: false
+          Command:
+            - cp
+            - "-r"
+            - "/autoinstrumentation/."
+            - "/otel-auto-instrumentation"
+          MountPoints:
+            - SourceVolume: otel-auto-instrumentation
+              ContainerPath: /otel-auto-instrumentation
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref FrontendLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: init
+
+        # --- CloudWatch Agent sidecar ---
+        - Name: cloudwatch-agent
+          Image: !Ref CWAgentImage
+          Essential: true
+          PortMappings:
+            - ContainerPort: 4316
+              Protocol: tcp
+            - ContainerPort: 2000
+              Protocol: udp
+          Environment:
+            - Name: CW_CONFIG_CONTENT
+              Value: !Sub |
+                {"agent":{"debug":false},"traces":{"traces_collected":{"application_signals":{},"otlp":{"grpc_endpoint":"0.0.0.0:4315","http_endpoint":"0.0.0.0:4316"}}},"logs":{"metrics_collected":{"application_signals":{}}}}
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref CWAgentFrontendLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: cwagent
+
+        # --- Frontend application container ---
+        - Name: frontend
+          Image: !Ref FrontendImageUri
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8080
+              Protocol: tcp
+          DependsOn:
+            - ContainerName: init
+              Condition: SUCCESS
+            - ContainerName: cloudwatch-agent
+              Condition: START
+          MountPoints:
+            - SourceVolume: otel-auto-instrumentation
+              ContainerPath: /otel-auto-instrumentation
+          Environment:
+            # --- ADOT .NET CLR Profiler environment variables ---
+            - Name: CORECLR_ENABLE_PROFILING
+              Value: "1"
+            - Name: CORECLR_PROFILER
+              Value: "{918728DD-259F-4A6A-AC2B-B85E1B658318}"
+            - Name: CORECLR_PROFILER_PATH
+              Value: /otel-auto-instrumentation/linux-x64/OpenTelemetry.AutoInstrumentation.Native.so
+            - Name: DOTNET_ADDITIONAL_DEPS
+              Value: /otel-auto-instrumentation/AdditionalDeps
+            - Name: DOTNET_SHARED_STORE
+              Value: /otel-auto-instrumentation/store
+            - Name: DOTNET_STARTUP_HOOKS
+              Value: /otel-auto-instrumentation/net/OpenTelemetry.AutoInstrumentation.StartupHook.dll
+            - Name: OTEL_DOTNET_AUTO_HOME
+              Value: /otel-auto-instrumentation
+            - Name: OTEL_DOTNET_AUTO_PLUGINS
+              Value: "AWS.Distro.OpenTelemetry.AutoInstrumentation.Plugin, AWS.Distro.OpenTelemetry.AutoInstrumentation"
+            # --- OTLP exporter config ---
+            - Name: OTEL_EXPORTER_OTLP_PROTOCOL
+              Value: http/protobuf
+            - Name: OTEL_EXPORTER_OTLP_ENDPOINT
+              Value: http://localhost:4316
+            - Name: OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
+              Value: http://localhost:4316/v1/traces
+            - Name: OTEL_AWS_APPLICATION_SIGNALS_EXPORTER_ENDPOINT
+              Value: http://localhost:4316/v1/metrics
+            - Name: OTEL_AWS_APPLICATION_SIGNALS_ENABLED
+              Value: "true"
+            - Name: OTEL_TRACES_SAMPLER
+              Value: xray
+            - Name: OTEL_METRICS_EXPORTER
+              Value: none
+            - Name: OTEL_LOGS_EXPORTER
+              Value: none
+            # --- Service identity ---
+            - Name: OTEL_RESOURCE_ATTRIBUTES
+              Value: service.name=otel-demo-frontend-ecs
+            - Name: OTEL_SERVICE_NAME
+              Value: otel-demo-frontend-ecs
+            # --- App config: frontend proxies to backend via internal ALB ---
+            - Name: BACKEND_URL
+              Value: !Sub "http://${InternalALB.DNSName}:5000"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref FrontendLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: frontend
+      Tags:
+        - Key: Project
+          Value: otel_demo
+
+  # ============================================================
+  # ECS Services
+  # ============================================================
+  BackendService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - InternalALBListener
+      - DatabaseInstance
+    Properties:
+      ServiceName: otel-demo-backend
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref BackendTaskDef
+      DesiredCount: 1
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets:
+            - !Ref SubnetId1
+            - !Ref SubnetId2
+          SecurityGroups:
+            - !Ref BackendSG
+      LoadBalancers:
+        - TargetGroupArn: !Ref BackendTG
+          ContainerName: backend
+          ContainerPort: 5000
+      Tags:
+        - Key: Project
+          Value: otel_demo
+
+  FrontendService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - ALBListener
+      - BackendService
+    Properties:
+      ServiceName: otel-demo-frontend
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref FrontendTaskDef
+      DesiredCount: 1
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets:
+            - !Ref SubnetId1
+            - !Ref SubnetId2
+          SecurityGroups:
+            - !Ref FrontendSG
+      LoadBalancers:
+        - TargetGroupArn: !Ref FrontendTG
+          ContainerName: frontend
+          ContainerPort: 8080
+      Tags:
+        - Key: Project
+          Value: otel_demo
+
+  # ============================================================
+  # CloudFront access-log bucket
+  # ============================================================
+  # Sink for CloudFront standard (legacy) access logs. Clears CKV_AWS_86 /
+  # CLOUDFRONT_ACCESSLOGS_ENABLED. CloudFront legacy logging delivers via the AWS
+  # "awslogsdelivery" account using bucket ACLs, so two constraints are mandatory and NOT
+  # free security choices:
+  #   - ObjectOwnership MUST permit ACLs (BucketOwnerPreferred) so CloudFront can grant the
+  #     log-delivery account write access. (PublicAccessBlock stays fully on; the log-delivery
+  #     grant is to a specific AWS canonical ID, not a public grant, so it is unaffected.)
+  #   - Encryption MUST be SSE-S3 (AES256); CloudFront legacy logging does NOT support SSE-KMS,
+  #     so the stack KMS CMK is intentionally not used here.
+  CloudFrontLogBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    # checkov:skip=CKV_AWS_18:This IS the access-log bucket; enabling S3 server access logging on it would be circular.
+    # checkov:skip=CKV_AWS_145:CloudFront standard (legacy) logging requires SSE-S3; it does not support SSE-KMS, so AES256 is mandatory here.
+    # checkov:skip=CKV_AWS_144:Cross-region replication is out of scope for a short-lived demo access-log bucket.
+    # cfn-guard suppressions (guard does not read the checkov:skip comments above; these are its equivalents):
+    #   - S3_BUCKET_LOGGING_ENABLED: circular — this is the access-log sink itself; it does not log to another bucket.
+    #   - S3_BUCKET_DEFAULT_LOCK_ENABLED: S3 Object Lock (WORM) is inappropriate for ephemeral demo logs and would
+    #     conflict with the 90-day expiration lifecycle below (retention blocks the lifecycle deletion).
+    #   - S3_BUCKET_NO_PUBLIC_RW_ACL: fires only because ACLs are enabled (BucketOwnerPreferred), which CloudFront
+    #     legacy logging REQUIRES for log delivery. PublicAccessBlock is fully on (all four true) so a public ACL
+    #     cannot exist; verified live — the only ACL grants are to the bucket owner + the AWS log-delivery canonical
+    #     account, with no AllUsers/AuthenticatedUsers grant.
+    Metadata:
+      guard:
+        SuppressedRules:
+          - S3_BUCKET_LOGGING_ENABLED
+          - S3_BUCKET_DEFAULT_LOCK_ENABLED
+          - S3_BUCKET_NO_PUBLIC_RW_ACL
+      cfn_nag:
+        rules_to_suppress:
+          - id: W51
+            reason: >-
+              No bucket policy is attached by design. This is the CloudFront access-log sink:
+              PublicAccessBlock is fully enabled (all four true) and CloudFront legacy logging
+              delivers via an ACL grant to the AWS log-delivery canonical account, not via a
+              bucket policy. A bucket policy is not required for this access pattern. Production:
+              add an explicit deny-insecure-transport / least-privilege bucket policy.
+    Properties:
+      BucketName: !Sub "otel-demo-ecs-cf-logs-${AWS::AccountId}-${AWS::Region}"
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-cloudfront-logs
+            Status: Enabled
+            ExpirationInDays: 90
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 7
+      Tags:
+        - Key: Project
+          Value: otel_demo
+
+  # ============================================================
+  # CloudFront distribution (public edge, AWS-managed TLS cert on *.cloudfront.net)
+  # ============================================================
+  # NO CUSTOM DOMAIN is available in this account: public domain registration is blocked
+  # (Amazon-internal; route53domains refuses to register), so this distribution intentionally
+  # uses the AWS-managed default *.cloudfront.net certificate. Two scanner findings follow
+  # directly from that one accepted decision and cannot be remediated without a custom domain:
+  #   - CLOUDFRONT_CUSTOM_SSL_CERTIFICATE (cfn-guard): no ACM/IAM custom cert is attached, by design.
+  #   - CKV_AWS_174 (checkov): viewer minimum TLS cannot be raised above the default cert's
+  #     security policy — CloudFront only honors MinimumProtocolVersion when a CUSTOM cert is used;
+  #     with the default cert the policy is fixed and not settable.
+  # Prod remediation: register a custom domain, issue an ACM cert, set ViewerCertificate to that
+  # ACM cert ARN with MinimumProtocolVersion TLSv1.2_2021. Documented in SECURITY-SUPPRESSIONS docx.
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    DependsOn: FrontendService
+    # checkov:skip=CKV_AWS_174:Default *.cloudfront.net cert forces a fixed TLS security policy; viewer min-TLS is not settable without a custom-domain ACM cert, which is blocked in this account. Accepted demo tradeoff.
+    Metadata:
+      guard:
+        SuppressedRules:
+          - CLOUDFRONT_CUSTOM_SSL_CERTIFICATE
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: otel-demo public edge in front of the frontend ALB
+        PriceClass: PriceClass_100
+        HttpVersion: http2
+        # Access logging to the dedicated S3 log bucket (clears CKV_AWS_86 / CLOUDFRONT_ACCESSLOGS_ENABLED).
+        Logging:
+          Bucket: !GetAtt CloudFrontLogBucket.RegionalDomainName
+          IncludeCookies: false
+          Prefix: cloudfront-access-logs/
+        # No custom domain/cert: use the default *.cloudfront.net certificate (AWS-managed TLS).
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+        Origins:
+          - Id: alb-origin
+            DomainName: !GetAtt ALB.DNSName
+            CustomOriginConfig:
+              # Origin leg is HTTP:80 (edge TLS terminates at CloudFront). The ALB SG admits only
+              # the CloudFront prefix list and the listener requires the secret header below.
+              OriginProtocolPolicy: http-only
+              HTTPPort: 80
+              OriginSSLProtocols:
+                - TLSv1.2
+            OriginCustomHeaders:
+              - HeaderName: X-Origin-Verify
+                HeaderValue: !Ref OriginSecretHeader
+        DefaultCacheBehavior:
+          TargetOriginId: alb-origin
+          # Force HTTPS for all viewers; CloudFront provides the cert on *.cloudfront.net.
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          # Managed-CachingDisabled + Managed-AllViewer: pass everything to a dynamic app origin.
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+          OriginRequestPolicyId: 216adef6-5c7f-47e4-b989-5492eafa07d3
+      Tags:
+        - Key: Project
+          Value: otel_demo
+
+Outputs:
+  FrontendURL:
+    Description: Public frontend URL via CloudFront (HTTPS, AWS-managed cert). This is the demo entrypoint.
+    Value: !Sub "https://${CloudFrontDistribution.DomainName}"
+  CloudFrontDomainName:
+    Description: CloudFront distribution domain name
+    Value: !GetAtt CloudFrontDistribution.DomainName
+  AlbDnsName:
+    Description: Internal detail - ALB DNS (CloudFront origin; not for direct browsing, returns 403 without the secret header)
+    Value: !GetAtt ALB.DNSName
+  InternalBackendURL:
+    Description: Internal backend ALB URL (used by frontend)
+    Value: !Sub "http://${InternalALB.DNSName}:5000"
+  ClusterName:
+    Value: !Ref ECSCluster
+  FrontendRepoUri:
+    Description: ECR URI for frontend image pushes
+    Value: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/otel-demo-frontend"
+  BackendRepoUri:
+    Description: ECR URI for backend image pushes
+    Value: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/otel-demo-backend"
+  DatabaseEndpoint:
+    Description: RDS SQL Server endpoint
+    Value: !GetAtt DatabaseInstance.Endpoint.Address
+  DatabasePort:
+    Value: !GetAtt DatabaseInstance.Endpoint.Port

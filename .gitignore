@@ -1,0 +1,28 @@
+# Windows "downloaded from the internet" metadata (WSL/NTFS)
+*:Zone.Identifier
+
+# Local authoring / working files (blog drafts, review artifacts, diagrams)
+*.docx
+*.png
+BBR-review-report.md
+scan-report-*.json
+architecture.drawio
+
+# AWS / credentials (never commit)
+*.pem
+*.key
+.aws/
+aws-credentials*
+
+# Build / tooling output
+build/
+dist/
+bin/
+obj/
+*.log
+
+# Editor / OS cruft
+.DS_Store
+.idea/
+.vscode/
+*.swp
