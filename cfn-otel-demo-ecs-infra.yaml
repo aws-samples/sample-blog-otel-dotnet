@@ -66,7 +66,7 @@ Parameters:
 Resources:
   # ============================================================
   # NOTE: ECR Repositories (otel-demo-frontend, otel-demo-backend)
-  # are created outside this stack to avoid circular dependency with image URIs.
+  # are owned by cfn-otel-demo-ecs-build.yaml (deploy it first; deploy-ecs.sh does both).
   # ============================================================
   # KMS CMK (encrypts CloudWatch Logs, Secrets Manager secret, and RDS storage)
   # ============================================================
@@ -169,8 +169,6 @@ Resources:
           ToPort: 8080
           SourceSecurityGroupId: !Ref AlbSG
           Description: App port 8080 from the ALB security group only
-          ToPort: 8080
-          SourceSecurityGroupId: !Ref AlbSG
       SecurityGroupEgress:
         - IpProtocol: "-1"
           CidrIp: 0.0.0.0/0
@@ -199,8 +197,6 @@ Resources:
           ToPort: 5000
           SourceSecurityGroupId: !Ref FrontendSG
           Description: App port 5000 from the frontend security group only
-          ToPort: 5000
-          SourceSecurityGroupId: !Ref FrontendSG
       SecurityGroupEgress:
         - IpProtocol: "-1"
           CidrIp: 0.0.0.0/0
@@ -229,8 +225,6 @@ Resources:
           ToPort: 5000
           SourceSecurityGroupId: !Ref InternalAlbSG
           Description: App port 5000 from the internal ALB security group only
-          ToPort: 5000
-          SourceSecurityGroupId: !Ref InternalAlbSG
       SecurityGroupEgress:
         - IpProtocol: "-1"
           CidrIp: 0.0.0.0/0
@@ -259,8 +253,6 @@ Resources:
           ToPort: 1433
           SourceSecurityGroupId: !Ref BackendSG
           Description: SQL Server port 1433 from the backend security group only
-          ToPort: 1433
-          SourceSecurityGroupId: !Ref BackendSG
       SecurityGroupEgress:
         - IpProtocol: "-1"
           CidrIp: 0.0.0.0/0
@@ -596,7 +588,8 @@ Resources:
     Properties:
       DBInstanceIdentifier: otel-demo-ecs-db
       Engine: sqlserver-ex
-      EngineVersion: "16.00"
+      # Pin the full version string (cfn-lint E3691 rejects the "16.00" major shorthand); matches the EC2 template.
+      EngineVersion: "16.00.4265.3.v1"
       DBInstanceClass: db.t3.small
       AllocatedStorage: 20
       StorageEncrypted: true
@@ -636,7 +629,7 @@ Resources:
       ContainerDefinitions:
         # --- Init container: copies ADOT .NET files to shared volume ---
         - Name: init
-          Image: public.ecr.aws/aws-observability/adot-autoinstrumentation-dotnet:v1.7.0
+          Image: public.ecr.aws/aws-observability/adot-autoinstrumentation-dotnet:v1.15.0@sha256:fde075c90e5f967d7f931f1eb50f0103e51431930d304bc4124d23fe8e64c495
           Essential: false
           Command:
             - cp
@@ -761,7 +754,7 @@ Resources:
       ContainerDefinitions:
         # --- Init container: copies ADOT .NET files to shared volume ---
         - Name: init
-          Image: public.ecr.aws/aws-observability/adot-autoinstrumentation-dotnet:v1.7.0
+          Image: public.ecr.aws/aws-observability/adot-autoinstrumentation-dotnet:v1.15.0@sha256:fde075c90e5f967d7f931f1eb50f0103e51431930d304bc4124d23fe8e64c495
           Essential: false
           Command:
             - cp

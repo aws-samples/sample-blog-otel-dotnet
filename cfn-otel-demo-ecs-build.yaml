@@ -1,0 +1,320 @@
+####################################################################################
+# DEMO / SAMPLE ONLY - NOT HARDENED FOR PRODUCTION USE.
+# Build stack for the ECS variant. Deploy this BEFORE cfn-otel-demo-ecs-infra.yaml:
+# it owns the two ECR repositories and an AWS CodeBuild project that builds the
+# .NET 10 frontend/backend images from app/ (uploaded as a zip to the source bucket)
+# and pushes them with an immutable tag. deploy-ecs.sh runs the whole flow:
+#   build stack -> upload source -> CodeBuild -> image digests -> ECS infra stack.
+# Kept separate from the ECS infra stack so the ECS services never start before
+# their images exist (no circular dependency, no custom resource).
+####################################################################################
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  otel-demo ECS build: ECR repositories (immutable tags, scan on push, KMS) and an
+  AWS CodeBuild project that builds and pushes the .NET 10 demo images.
+  DEMO/SAMPLE ONLY - not hardened for production (see header comment).
+
+Parameters:
+  RepoPrefix:
+    Type: String
+    Default: otel-demo
+    AllowedPattern: "^[a-z0-9][a-z0-9-]{1,40}$"
+    Description: >-
+      Prefix for the ECR repositories (<prefix>-frontend, <prefix>-backend). Must match the
+      repository names cfn-otel-demo-ecs-infra.yaml expects (default otel-demo).
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # KMS CMK: encrypts the source bucket, ECR images, build logs and artifacts
+  # ---------------------------------------------------------------------------
+  BuildKmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: otel-demo ECS build - S3 source, ECR, CodeBuild logs
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AccountRootAdmin
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+          - Sid: CloudWatchLogsUse
+            Effect: Allow
+            Principal:
+              Service: !Sub "logs.${AWS::Region}.amazonaws.com"
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: "*"
+            Condition:
+              ArnLike:
+                kms:EncryptionContext:aws:logs:arn: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/codebuild/${RepoPrefix}-images"
+      Tags:
+        - Key: Project
+          Value: otel_demo
+
+  BuildKmsAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/${RepoPrefix}-ecs-build"
+      TargetKeyId: !Ref BuildKmsKey
+
+  # ---------------------------------------------------------------------------
+  # Source bucket: holds the app/ zip that CodeBuild builds from
+  # ---------------------------------------------------------------------------
+  SourceBucket:
+    Type: AWS::S3::Bucket
+    # checkov:skip=CKV_AWS_18:Short-lived build-source bucket for a demo; it only holds the app/ zip that CodeBuild reads. Access logging would need a second log bucket for no demo value. Prod: enable server access logging to a central log bucket.
+    Metadata:
+      # cfn-guard false positives / demo-appropriate design decisions on this transient build-source bucket:
+      #  - S3_BUCKET_SSL_REQUESTS_ONLY: TLS is enforced by the adjacent SourceBucketPolicy (DenyInsecureTransport);
+      #    cfn-guard evaluates the bucket resource in isolation and cannot see the separate BucketPolicy.
+      #  - S3_BUCKET_NO_PUBLIC_RW_ACL: no ACL is set because ACLs are DISABLED (BucketOwnerEnforced) and all public
+      #    access is blocked (PublicAccessBlockConfiguration all true) -- strictly safer than any ACL.
+      #  - S3_BUCKET_LOGGING_ENABLED: same as the CKV_AWS_18 skip above (short-lived demo source bucket; prod would
+      #    log to a central bucket). Duplicated here because cfn-guard raises its own rule id.
+      #  - S3_BUCKET_DEFAULT_LOCK_ENABLED: Object Lock is deliberately NOT enabled -- it is incompatible with the
+      #    30-day ExpireOldSource lifecycle rule (locked objects cannot be expired) and inappropriate for a
+      #    disposable build-source bucket.
+      guard:
+        SuppressedRules:
+          - S3_BUCKET_SSL_REQUESTS_ONLY
+          - S3_BUCKET_NO_PUBLIC_RW_ACL
+          - S3_BUCKET_LOGGING_ENABLED
+          - S3_BUCKET_DEFAULT_LOCK_ENABLED
+      checkov:
+        skip:
+          - id: CKV_AWS_18
+            comment: >-
+              Short-lived build-source bucket for a demo; it only holds the app/ zip CodeBuild
+              reads. Prod: enable server access logging to a central log bucket.
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !GetAtt BuildKmsKey.Arn
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldSource
+            Status: Enabled
+            ExpirationInDays: 30
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 7
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+      Tags:
+        - Key: Project
+          Value: otel_demo
+
+  SourceBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SourceBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt SourceBucket.Arn
+              - !Sub "${SourceBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  # ---------------------------------------------------------------------------
+  # ECR repositories (immutable tags, scan on push, KMS-encrypted)
+  # EmptyOnDelete lets a stack delete remove the demo images (no manual cleanup).
+  # ---------------------------------------------------------------------------
+  FrontendRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${RepoPrefix}-frontend"
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      EncryptionConfiguration:
+        EncryptionType: KMS
+        KmsKey: !GetAtt BuildKmsKey.Arn
+      EmptyOnDelete: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {"rules":[{"rulePriority":1,"description":"Keep the 10 most recent images","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":10},"action":{"type":"expire"}}]}
+      Tags:
+        - Key: Project
+          Value: otel_demo
+
+  BackendRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${RepoPrefix}-backend"
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      EncryptionConfiguration:
+        EncryptionType: KMS
+        KmsKey: !GetAtt BuildKmsKey.Arn
+      EmptyOnDelete: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {"rules":[{"rulePriority":1,"description":"Keep the 10 most recent images","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":10},"action":{"type":"expire"}}]}
+      Tags:
+        - Key: Project
+          Value: otel_demo
+
+  # ---------------------------------------------------------------------------
+  # CodeBuild
+  # ---------------------------------------------------------------------------
+  BuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/codebuild/${RepoPrefix}-images"
+      RetentionInDays: 30
+      KmsKeyId: !GetAtt BuildKmsKey.Arn
+
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      # Least-privilege permissions are attached as a customer-managed policy (not an inline
+      # Policies block) to satisfy cfn-guard IAM_NO_INLINE_POLICY_CHECK.
+      ManagedPolicyArns:
+        - !Ref CodeBuildPolicy
+      Tags:
+        - Key: Project
+          Value: otel_demo
+
+  CodeBuildPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "${RepoPrefix}-image-build"
+      Description: Least-privilege permissions for the otel-demo image CodeBuild project.
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: BuildLogs
+            Effect: Allow
+            Action:
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: !Sub "${BuildLogGroup.Arn}:*"
+          - Sid: ReadSource
+            Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:GetObjectVersion
+            Resource: !Sub "${SourceBucket.Arn}/source/*"
+          - Sid: SourceBucketLocation
+            Effect: Allow
+            Action:
+              - s3:GetBucketLocation
+              - s3:GetBucketAcl
+            Resource: !GetAtt SourceBucket.Arn
+          # GetAuthorizationToken is an account-level action; it does not support resource scoping.
+          - Sid: EcrLogin
+            Effect: Allow
+            Action: ecr:GetAuthorizationToken
+            Resource: "*"
+          - Sid: EcrPush
+            Effect: Allow
+            Action:
+              - ecr:BatchCheckLayerAvailability
+              - ecr:InitiateLayerUpload
+              - ecr:UploadLayerPart
+              - ecr:CompleteLayerUpload
+              - ecr:PutImage
+              - ecr:BatchGetImage
+              - ecr:GetDownloadUrlForLayer
+            Resource:
+              - !GetAtt FrontendRepository.Arn
+              - !GetAtt BackendRepository.Arn
+          - Sid: UseBuildKey
+            Effect: Allow
+            Action:
+              - kms:Decrypt
+              - kms:Encrypt
+              - kms:GenerateDataKey
+              - kms:DescribeKey
+            Resource: !GetAtt BuildKmsKey.Arn
+
+  ImageBuildProject:
+    Type: AWS::CodeBuild::Project
+    # checkov:skip=CKV_AWS_316:Privileged mode is required for docker build inside CodeBuild (no other supported way to build container images on the standard image). The project only builds this sample's app/ source from a private, KMS-encrypted bucket.
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_316
+            comment: >-
+              Privileged mode is required for docker build inside CodeBuild. The project only
+              builds this sample's app/ source from a private, KMS-encrypted bucket.
+    Properties:
+      Name: !Sub "${RepoPrefix}-images"
+      Description: Builds and pushes the otel-demo .NET 10 frontend/backend images
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      EncryptionKey: !GetAtt BuildKmsKey.Arn
+      TimeoutInMinutes: 30
+      Source:
+        Type: S3
+        Location: !Sub "${SourceBucket}/source/app-source.zip"
+        BuildSpec: buildspec.yml
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux-x86_64-standard:5.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: FRONTEND_REPO_URI
+            Value: !GetAtt FrontendRepository.RepositoryUri
+          - Name: BACKEND_REPO_URI
+            Value: !GetAtt BackendRepository.RepositoryUri
+          - Name: IMAGE_TAG
+            Value: set-at-start-build
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref BuildLogGroup
+      Tags:
+        - Key: Project
+          Value: otel_demo
+
+Outputs:
+  SourceBucketName:
+    Description: Upload the app/ source zip to s3://<bucket>/source/app-source.zip
+    Value: !Ref SourceBucket
+  BuildProjectName:
+    Value: !Ref ImageBuildProject
+  FrontendRepoUri:
+    Value: !GetAtt FrontendRepository.RepositoryUri
+  BackendRepoUri:
+    Value: !GetAtt BackendRepository.RepositoryUri
