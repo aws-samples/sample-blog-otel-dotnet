@@ -1,6 +1,7 @@
 ####################################################################################
 # DEMO / SAMPLE ONLY - NOT HARDENED FOR PRODUCTION USE.
-# On-premises credential stack for the OTel .NET on IIS blog post. Creates the AWS
+# On-premises credential stack for the blog post
+# "Observability in AWS for .NET apps across EC2, ECS, and on-premises". Creates the AWS
 # IAM Roles Anywhere resources that let an on-premises Windows server (or laptop)
 # authenticate the CloudWatch Agent with an X.509 client certificate instead of
 # long-lived access keys:

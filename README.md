@@ -1,6 +1,6 @@
-# Observability for .NET applications: migrate and modernize across EC2, ECS and on-prem
+# Observability in AWS for .NET apps across EC2, ECS, and on-premises
 
-Companion sample code for the blog post *"Observability for .NET applications: migrate and modernize across EC2, ECS and on-prem"*. It deploys a
+Companion sample code for the blog post *"Observability in AWS for .NET apps across EC2, ECS, and on-premises"*. It deploys a
 small two-tier .NET 10 (LTS) order application and instruments it with the **AWS Distro for
 OpenTelemetry (ADOT) .NET auto-instrumentation** — no application code changes — sending traces
 and metrics to **CloudWatch Application Signals** and **AWS X-Ray**.
