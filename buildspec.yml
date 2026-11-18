@@ -1,0 +1,21 @@
+# CodeBuild buildspec for the ECS variant (used by cfn-otel-demo-ecs-build.yaml).
+# FRONTEND_REPO_URI / BACKEND_REPO_URI come from the project; IMAGE_TAG is set per build
+# by deploy-ecs.sh. Repositories are IMMUTABLE, so every build uses a new tag (never :latest).
+version: 0.2
+
+phases:
+  pre_build:
+    commands:
+      - test "$IMAGE_TAG" != "set-at-start-build" || { echo "IMAGE_TAG not set"; exit 1; }
+      - REGISTRY="${FRONTEND_REPO_URI%%/*}"
+      - aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$REGISTRY"
+  build:
+    commands:
+      - docker build -t "$BACKEND_REPO_URI:$IMAGE_TAG" app/backend
+      - docker build -t "$FRONTEND_REPO_URI:$IMAGE_TAG" app/frontend
+  post_build:
+    commands:
+      - test "$CODEBUILD_BUILD_SUCCEEDING" = "1"
+      - docker push "$BACKEND_REPO_URI:$IMAGE_TAG"
+      - docker push "$FRONTEND_REPO_URI:$IMAGE_TAG"
+      - echo "Pushed $BACKEND_REPO_URI:$IMAGE_TAG and $FRONTEND_REPO_URI:$IMAGE_TAG"

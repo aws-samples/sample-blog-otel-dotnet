@@ -744,33 +744,54 @@ Resources:
                     Install-WindowsFeature -Name Web-Asp-Net45 | Out-Null
                   }
 
-                  # 2. .NET 8 SDK (needed to publish the app)
+                  # 2. .NET 10 SDK (needed to publish the app)
                   $dotnet = 'C:\Program Files\dotnet\dotnet.exe'
-                  if (-not (Test-Path $dotnet)) {
+                  # Version-aware check (not just dotnet.exe) so a re-run on an older install still lands SDK 10.0.404.
+                  if (-not (Test-Path 'C:\Program Files\dotnet\sdk\10.0.404')) {
                     # Holmes-suppress (Dependency and Supply Chain Security): the dotnet-install.ps1 bootstrapper is fetched
                     #   from the unversioned https://dot.net/v1/ endpoint rather than a pinned/hash-verified script.
                     # Justification: dot.net/v1/dotnet-install.ps1 is Microsoft's OFFICIAL, documented installer endpoint,
                     #   served over HTTPS from a Microsoft-controlled host. Microsoft's own guidance is to fetch this script
                     #   fresh; there is no versioned permalink or published hash for the installer script itself. The SDK
-                    #   PAYLOAD it installs IS pinned (-Version 8.0.426), so the installed runtime is deterministic.
+                    #   PAYLOAD it installs IS pinned (-Version 10.0.404), so the installed runtime is deterministic.
                     # Accepted demo tradeoff: residual risk is a compromise of Microsoft's own CDN — out of scope for a
                     #   short-lived demo. PROD hardening: vendor a reviewed copy of dotnet-install.ps1 into the repo (or pin to
                     #   a dotnet/install-scripts commit) and add a Get-FileHash SHA256 check that aborts on mismatch.
                     Invoke-WebRequest -Uri 'https://dot.net/v1/dotnet-install.ps1' -OutFile C:\otel-demo\dotnet-install.ps1 -UseBasicParsing
-                    # SDK payload pinned to an exact patch (8.0.426) for reproducible installs (Holmes: Dependency and Supply Chain Security).
-                    & C:\otel-demo\dotnet-install.ps1 -Version 8.0.426 -InstallDir 'C:\Program Files\dotnet'
+                    # SDK payload pinned to an exact patch (10.0.404) for reproducible installs (Holmes: Dependency and Supply Chain Security).
+                    & C:\otel-demo\dotnet-install.ps1 -Version 10.0.404 -InstallDir 'C:\Program Files\dotnet'
                     [Environment]::SetEnvironmentVariable('PATH', 'C:\Program Files\dotnet;' + [Environment]::GetEnvironmentVariable('PATH','Machine'), 'Machine')
                   }
                   $env:PATH = 'C:\Program Files\dotnet;' + $env:PATH
 
                   # 3. ASP.NET Core Hosting Bundle (ANCM) - pinned to an exact version (Holmes: Dependency and Supply Chain Security).
+                  # Guard on the ASP.NET Core Module V2 (ANCM) native DLL, NOT on the shared-framework path.
+                  # The .NET SDK install (step 2) ALSO creates C:\Program Files\dotnet\shared\Microsoft.AspNetCore.App\10.0.15,
+                  # so guarding on that path wrongly SKIPS the Hosting Bundle (and therefore ANCM) on every run — leaving
+                  # IIS with no module to launch the inprocess app (HTTP 500.3x, no managed process, no stdout log).
+                  # ANCM's aspnetcorev2.dll is provided ONLY by the Hosting Bundle, so it is the correct install sentinel.
                   $ancm = 'C:\Program Files\IIS\Asp.Net Core Module\V2\aspnetcorev2.dll'
                   if (-not (Test-Path $ancm)) {
-                    $url = 'https://builds.dotnet.microsoft.com/dotnet/aspnetcore/Runtime/8.0.32/dotnet-hosting-8.0.32-win.exe'
+                    $url = 'https://builds.dotnet.microsoft.com/dotnet/aspnetcore/Runtime/10.0.15/dotnet-hosting-10.0.15-win.exe'
+                    # SHA512 from Microsoft's official release metadata (release-metadata/10.0/releases.json, 10.0.15).
+                    $hostingSha512 = '48dd82516cae1296fe8e6e6c0fbeb4a00033951966373bc1e8309ecd1e02f9f344db701dadb2344568d7ae86ef968439a4708fef5df3cf742d207cf585b5bf5e'
                     Invoke-WebRequest -Uri $url -OutFile C:\otel-demo\hosting.exe -UseBasicParsing
-                    Start-Process C:\otel-demo\hosting.exe -ArgumentList '/quiet','/norestart' -Wait
+                    $actualHostingSha = (Get-FileHash C:\otel-demo\hosting.exe -Algorithm SHA512).Hash.ToLower()
+                    if ($actualHostingSha -ne $hostingSha512) {
+                      throw ("Hosting Bundle integrity check FAILED: expected $hostingSha512 but got $actualHostingSha. Aborting bootstrap.")
+                    }
+                    # Use explicit /install with a verbose /log. A bare '/quiet /norestart' can run a REDUCED install
+                    # that skips the ANCM component when a .NET runtime is already present; '/install' forces the full
+                    # component set (AspNetCoreModuleV2_x64). The log is kept for post-mortem if the module is missing.
+                    $hostingLog = 'C:\otel-demo\hosting-install.log'
+                    $hp = Start-Process C:\otel-demo\hosting.exe -ArgumentList '/install','/quiet','/norestart','/log',$hostingLog -Wait -PassThru
                     Remove-Item C:\otel-demo\hosting.exe -Force -ErrorAction SilentlyContinue
                     iisreset /restart | Out-Null
+                    # Fail loudly if ANCM still isn't registered — otherwise the app silently 500s at first request.
+                    if (-not (Test-Path $ancm)) {
+                      throw ("ASP.NET Core Module V2 not installed after Hosting Bundle (exit $($hp.ExitCode)). See $hostingLog.")
+                    }
+                    Write-Output "ASP.NET Core Module V2 (ANCM) installed and verified."
                   }
 
                   # 4. CloudWatch Agent (Application Signals traces/metrics + IIS & event logs)
@@ -834,7 +855,7 @@ Resources:
                   }
                   Write-Output "ADOT module v1.15.0 integrity verified (SHA256 match)."
                   Import-Module $mod -Force
-                  $adotInstalled = Test-Path 'C:\Program Files\AWS Distro for OpenTelemetry AutoInstrumentation\net\net8.0\OpenTelemetry.Api.dll'
+                  $adotInstalled = Test-Path 'C:\Program Files\AWS Distro for OpenTelemetry AutoInstrumentation\net\net10.0\OpenTelemetry.Api.dll'
                   if (-not $adotInstalled) { Install-OpenTelemetryCore } else { Write-Output 'ADOT core already installed; skipping Install-OpenTelemetryCore.' }
                   $otel = [ordered]@{
                     'OTEL_EXPORTER_OTLP_PROTOCOL' = 'http/protobuf'
@@ -970,7 +991,7 @@ Resources:
                     $proj = @'
                   <Project Sdk="Microsoft.NET.Sdk.Web">
                     <PropertyGroup>
-                      <TargetFramework>net8.0</TargetFramework>
+                      <TargetFramework>net10.0</TargetFramework>
                       <ImplicitUsings>enable</ImplicitUsings>
                     </PropertyGroup>
                     <ItemGroup>
@@ -1101,7 +1122,7 @@ Resources:
                     $proj = @'
                   <Project Sdk="Microsoft.NET.Sdk.Web">
                     <PropertyGroup>
-                      <TargetFramework>net8.0</TargetFramework>
+                      <TargetFramework>net10.0</TargetFramework>
                       <ImplicitUsings>enable</ImplicitUsings>
                     </PropertyGroup>
                   </Project>

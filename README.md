@@ -1,7 +1,7 @@
-# Full Observability for .NET on AWS — ADOT Zero-Code Auto-Instrumentation
+# Observability for .NET applications: migrate and modernize across EC2, ECS and on-prem
 
-Companion sample code for the blog post *"Full Observability for .NET on IIS"*. It deploys a
-small two-tier .NET 8 order application and instruments it with the **AWS Distro for
+Companion sample code for the blog post *"Observability for .NET applications: migrate and modernize across EC2, ECS and on-prem"*. It deploys a
+small two-tier .NET 10 (LTS) order application and instruments it with the **AWS Distro for
 OpenTelemetry (ADOT) .NET auto-instrumentation** — no application code changes — sending traces
 and metrics to **CloudWatch Application Signals** and **AWS X-Ray**.
 
@@ -15,7 +15,8 @@ Two CloudFormation variants of the same application:
 | Template | Compute | Summary |
 |---|---|---|
 | `cfn-otel-demo-ec2-infra.yaml` | Windows Server 2022 EC2 + IIS | Frontend + Backend on IIS, Amazon RDS for SQL Server, fronted by CloudFront. Bootstrapped over SSM. |
-| `cfn-otel-demo-ecs-infra.yaml` | Linux containers on ECS Fargate | Containerized frontend/backend with a CloudWatch Agent sidecar. |
+| `cfn-otel-demo-ecs-infra.yaml` | Linux containers on ECS Fargate | Containerized frontend/backend with a CloudWatch Agent sidecar. Images come from the build stack below. |
+| `cfn-otel-demo-ecs-build.yaml` | AWS CodeBuild + Amazon ECR | Builds the .NET 10 container images from `app/` (no local Docker needed) and pushes them with immutable tags. |
 
 Both are fronted by CloudFront over public HTTPS using the default `*.cloudfront.net`
 certificate (no custom domain / ACM cert required).
@@ -62,6 +63,18 @@ Re-run only the app bootstrap against an existing stack (idempotent):
 > Always confirm a bootstrap actually ran your new code by checking the SSM command's
 > `StandardOutputContent`, not just its `Success` status.
 
+### ECS variant
+
+`deploy-ecs.sh` deploys the build stack, uploads `app/` to its source bucket, builds and pushes
+the images in CodeBuild with a new immutable tag, resolves the image digests, and deploys the
+ECS infra stack with `image@sha256` URIs. No local Docker is required.
+
+```bash
+./deploy-ecs.sh --profile <your-profile> --region us-west-2
+```
+
+Rebuild the images only (for example after an app change): `./deploy-ecs.sh ... --build-only`.
+
 ## Verify
 
 ```bash
@@ -94,8 +107,12 @@ aws cloudformation delete-stack --stack-name otel-demo-ec2 \
 aws cloudformation wait stack-delete-complete --stack-name otel-demo-ec2 \
   --profile <your-profile> --region us-west-2
 
-# ECS variant (use the name you deployed it under)
+# ECS variant: delete the infra stack first, then the build stack (ECR repos + CodeBuild)
 aws cloudformation delete-stack --stack-name otel-demo-ecs \
+  --profile <your-profile> --region us-west-2
+aws cloudformation wait stack-delete-complete --stack-name otel-demo-ecs \
+  --profile <your-profile> --region us-west-2
+aws cloudformation delete-stack --stack-name otel-demo-ecs-build \
   --profile <your-profile> --region us-west-2
 ```
 
@@ -103,10 +120,10 @@ Notes:
 - **RDS:** if you enabled deletion protection or final snapshots on the DB, the delete will
   stall until you disable protection / allow the snapshot. Check the stack events if a delete
   hangs on the database resource.
-- **ECR repositories:** the `otel-demo-frontend` / `otel-demo-backend` repos are created
-  **outside** this stack (to avoid a circular dependency with the image URIs), so they are
-  **not** removed by the stack delete. Delete them separately if you no longer need the images:
-  `aws ecr delete-repository --repository-name otel-demo-frontend --force` (and `-backend`).
+- **ECR repositories:** the `otel-demo-frontend` / `otel-demo-backend` repos are owned by the
+  build stack (`EmptyOnDelete: true`), so deleting `otel-demo-ecs-build` removes them and their
+  images. The build stack's source bucket is versioned; empty it first if the delete reports
+  `BucketNotEmpty`.
 - **CloudWatch log groups** with a retention policy are removed with the stack; verify none
   remain if you want to stop all charges.
 
@@ -124,8 +141,13 @@ cert). Validation is provable: a connection to the RDS **IP** is correctly rejec
 *"The target principal name is incorrect."*
 
 ### Pinned dependencies
-- **.NET SDK** pinned to `8.0.426` (not `-Channel 8.0`).
-- **ASP.NET Core Hosting Bundle** pinned to `8.0.32`.
+- **.NET SDK** pinned to `10.0.404` (not `-Channel 10.0`).
+- **ASP.NET Core Hosting Bundle** pinned to `10.0.15`, with a SHA512 integrity check against
+  Microsoft's official release metadata; the bootstrap aborts on mismatch.
+- **ECS container base images** pinned by tag and digest: `mcr.microsoft.com/dotnet/sdk:10.0.404`
+  and `mcr.microsoft.com/dotnet/aspnet:10.0.15`. Containers run as the image's non-root `app` user.
+- **ADOT .NET init image (ECS)** pinned to `v1.15.0` by digest (same release as the EC2 path;
+  .NET 10 support requires ADOT .NET v1.12.0 or later).
 - **ADOT .NET module** pinned to release **`v1.15.0`** with the vendor-published SHA256
   integrity check (`AWS.Otel.DotNet.Auto.psm1.sha256`); the bootstrap aborts on mismatch.
 
@@ -134,7 +156,7 @@ Two bootstrap downloads use vendor "latest"/unversioned endpoints and are suppre
 justification rather than pinned, because they are official first-party endpoints over HTTPS
 with no vendor-published per-artifact hash:
 - `dotnet-install.ps1` from `https://dot.net/v1/` (Microsoft's official installer; the SDK
-  *payload* it installs is pinned to `8.0.426`).
+  *payload* it installs is pinned to `10.0.404`).
 - The CloudWatch Agent MSI from the regional `amazoncloudwatch-agent-<region>` S3 `latest`
   path. (A self-computed hash was deliberately **not** embedded — it would only attest a
   one-time download, not AWS's publication.)
@@ -160,6 +182,11 @@ relabel the node with an ADOT Collector attributes processor (no app code).
 cfn-otel-demo-ec2-infra.yaml    CloudFormation: Windows EC2 + IIS + RDS variant
 cfn-otel-demo-ecs-infra.yaml    CloudFormation: Linux ECS Fargate variant
 deploy-and-bootstrap.sh         Deploys the stack and runs the app bootstrap over SSM
+cfn-otel-demo-ecs-build.yaml    CloudFormation: ECR repos + CodeBuild image build (ECS variant)
+buildspec.yml                   CodeBuild build spec (builds/pushes both images)
+deploy-ecs.sh                   ECS end-to-end: build stack -> CodeBuild -> ECS infra stack
+app/frontend/                   ECS frontend: .NET 10 minimal API + Dockerfile
+app/backend/                    ECS backend: .NET 10 minimal API + Dockerfile (fetches RDS CA bundle at build)
 ```
 
 ## Security

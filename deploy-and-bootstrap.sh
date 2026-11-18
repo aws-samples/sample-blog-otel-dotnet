@@ -4,7 +4,7 @@
 #
 # Deploys the otel-demo-ec2 infrastructure stack (cfn-otel-demo-ec2-infra.yaml)
 # and then runs the in-stack SSM bootstrap document against the backend and
-# frontend instances to install IIS + .NET 8 + ASP.NET Core Hosting Bundle (ANCM)
+# frontend instances to install IIS + .NET 10 + ASP.NET Core Hosting Bundle (ANCM)
 # + CloudWatch Agent (Application Signals) + ADOT .NET auto-instrumentation and
 # publish the demo app.
 #
@@ -103,9 +103,28 @@ if [[ "$SKIP_DEPLOY" != "true" ]]; then
   fi
 
   log "Deploying stack '$STACK' (VPC=$VPC subnets=$SUBNET,$SUBNET2 pl=$PREFIX_LIST)"
+  # The template exceeds CloudFormation's 51,200-byte inline limit, so it MUST be staged in S3.
+  # `cloudformation deploy` does not auto-stage; it needs an explicit --s3-bucket. Create a
+  # per-account/region staging bucket (private) on demand and reuse it.
+  ACCOUNT_ID=$("${AWS[@]}" sts get-caller-identity --query Account --output text)
+  STAGING_BUCKET="cfn-staging-${ACCOUNT_ID}-${REGION}"
+  if ! "${AWS[@]}" s3api head-bucket --bucket "$STAGING_BUCKET" 2>/dev/null; then
+    log "Creating private CFN staging bucket $STAGING_BUCKET"
+    if [[ "$REGION" == "us-east-1" ]]; then
+      "${AWS[@]}" s3api create-bucket --bucket "$STAGING_BUCKET" >/dev/null \
+        || die "could not create staging bucket $STAGING_BUCKET"
+    else
+      "${AWS[@]}" s3api create-bucket --bucket "$STAGING_BUCKET" \
+        --create-bucket-configuration LocationConstraint="$REGION" >/dev/null \
+        || die "could not create staging bucket $STAGING_BUCKET"
+    fi
+    "${AWS[@]}" s3api put-public-access-block --bucket "$STAGING_BUCKET" \
+      --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true >/dev/null 2>&1 || true
+  fi
   "${AWS[@]}" cloudformation deploy \
     --template-file "$TEMPLATE" \
     --stack-name "$STACK" \
+    --s3-bucket "$STAGING_BUCKET" --s3-prefix "$STACK" \
     --capabilities CAPABILITY_NAMED_IAM \
     --parameter-overrides \
       VpcId="$VPC" SubnetId="$SUBNET" SubnetId2="$SUBNET2" \
