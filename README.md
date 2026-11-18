@@ -158,8 +158,11 @@ with no vendor-published per-artifact hash:
 - `dotnet-install.ps1` from `https://dot.net/v1/` (Microsoft's official installer; the SDK
   *payload* it installs is pinned to `10.0.404`).
 - The CloudWatch Agent MSI from the regional `amazoncloudwatch-agent-<region>` S3 `latest`
-  path. (A self-computed hash was deliberately **not** embedded — it would only attest a
-  one-time download, not AWS's publication.)
+  path, **EC2 bootstrap only**. (A self-computed hash was deliberately **not** embedded — it
+  would only attest a one-time download, not AWS's publication.) The **on-prem** bootstrap
+  (`bootstrap-onprem.ps1`) does not use `latest`: it pins the MSI to version
+  `1.300073.2b1889` (`-CwAgentVersion`) and aborts unless the MSI's Authenticode signature is
+  `Valid` and issued to *Amazon Web Services, Inc.*
 
 For production: vendor/mirror these artifacts into an internal store and verify against
 organization-controlled hashes.
