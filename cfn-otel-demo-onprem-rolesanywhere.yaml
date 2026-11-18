@@ -1,0 +1,116 @@
+####################################################################################
+# DEMO / SAMPLE ONLY - NOT HARDENED FOR PRODUCTION USE.
+# On-premises credential stack for the OTel .NET on IIS blog post. Creates the AWS
+# IAM Roles Anywhere resources that let an on-premises Windows server (or laptop)
+# authenticate the CloudWatch Agent with an X.509 client certificate instead of
+# long-lived access keys:
+#   Trust anchor (trusts your CA)  ->  IAM role (what the server may do)  ->  Profile.
+# The on-prem server runs the IAM Roles Anywhere credential helper
+# (aws_signing_helper credential-process) referencing this trust anchor + profile.
+#
+# DEMO SCOPING NOTES (read before using beyond a test):
+#  - The trust anchor references an AWS Private CA (ACM PCA) by ARN. Create the
+#    Private CA first (see the runbook) and pass its ARN as PrivateCaArn.
+#  - The role attaches the two AWS managed policies the CloudWatch Agent needs
+#    (CloudWatchAgentServerPolicy + AWSXrayWriteOnlyAccess). Scope these down to
+#    only the log groups / namespaces your fleet uses for production.
+#  - Consider adding a Roles Anywhere profile SessionPolicy and a trust-policy
+#    condition on the certificate subject (aws:PrincipalTag) to limit which certs
+#    may assume the role.
+####################################################################################
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  otel-demo on-prem: IAM Roles Anywhere trust anchor (from AWS Private CA) + IAM
+  role + profile so an on-premises Windows server authenticates the CloudWatch
+  Agent with an X.509 certificate (no long-lived access keys). DEMO/SAMPLE ONLY -
+  not hardened for production (see header comment).
+
+Parameters:
+  PrivateCaArn:
+    Type: String
+    Description: >-
+      ARN of the AWS Private CA (ACM PCA) that issues the on-premises host
+      certificate. The Roles Anywhere trust anchor references this CA directly.
+      Create the Private CA first (see the runbook).
+
+  TrustAnchorName:
+    Type: String
+    Default: otel-demo-onprem
+    AllowedPattern: "^[a-zA-Z0-9][a-zA-Z0-9_-]{0,254}$"
+    Description: Name for the Roles Anywhere trust anchor and profile.
+
+Resources:
+
+  # Trust anchor: establishes trust between Roles Anywhere and your AWS Private CA,
+  # referenced by ARN (no CA bundle upload).
+  TrustAnchor:
+    Type: AWS::RolesAnywhere::TrustAnchor
+    Properties:
+      Name: !Ref TrustAnchorName
+      Enabled: true
+      Source:
+        SourceType: AWS_ACM_PCA
+        SourceData:
+          AcmPcaArn: !Ref PrivateCaArn
+
+  # The role the on-prem server assumes via Roles Anywhere. The trust policy is scoped
+  # to THIS trust anchor's ARN so only sessions originating from it can assume the role.
+  OnPremCWAgentRole:
+    Type: AWS::IAM::Role
+    # cfn_nag W28 / checkov CKV_AWS_108: no explicit RoleName is set, so CloudFormation
+    # generates a unique name - avoids collisions when the stack is deployed more than once
+    # and is the recommended practice for public samples. The app references the role by the
+    # stack output ARN, not by a hardcoded name.
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: >-
+              The two AWS managed policies (CloudWatchAgentServerPolicy,
+              AWSXrayWriteOnlyAccess) are the documented least-privilege set for the
+              CloudWatch Agent + ADOT trace export; they are the same policies used on
+              EC2 in this sample. Prod: scope to specific log groups / X-Ray.
+      checkov:
+        skip:
+          - id: CKV_AWS_107
+            comment: Managed policies here grant write to CloudWatch/X-Ray only, not credential exposure.
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: rolesanywhere.amazonaws.com
+            Action:
+              - sts:AssumeRole
+              - sts:TagSession
+              - sts:SetSourceIdentity
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt TrustAnchor.TrustAnchorArn
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+        - arn:aws:iam::aws:policy/AWSXrayWriteOnlyAccess
+      Tags:
+        - Key: Project
+          Value: otel_demo
+
+  # Profile: maps an authenticated Roles Anywhere session to the role above.
+  OnPremProfile:
+    Type: AWS::RolesAnywhere::Profile
+    Properties:
+      Name: !Ref TrustAnchorName
+      Enabled: true
+      RoleArns:
+        - !GetAtt OnPremCWAgentRole.Arn
+
+Outputs:
+  TrustAnchorArn:
+    Description: Pass to aws_signing_helper --trust-anchor-arn
+    Value: !GetAtt TrustAnchor.TrustAnchorArn
+  ProfileArn:
+    Description: Pass to aws_signing_helper --profile-arn
+    Value: !GetAtt OnPremProfile.ProfileArn
+  RoleArn:
+    Description: Pass to aws_signing_helper --role-arn (and reference this ARN, not a hardcoded name)
+    Value: !GetAtt OnPremCWAgentRole.Arn

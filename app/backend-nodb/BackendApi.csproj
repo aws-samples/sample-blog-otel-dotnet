@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <!-- Keep the same output assembly name as the SQL backend so IIS / ADOT / deploy
+         scripts can target BackendApi.dll identically. -->
+    <AssemblyName>BackendApi</AssemblyName>
+  </PropertyGroup>
+  <!-- No Microsoft.Data.SqlClient: this variant stores orders in memory (no database). -->
+</Project>
